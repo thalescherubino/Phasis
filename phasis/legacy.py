@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 
-version = 'v 5.3'
+version = 'v 2.5.3'
 
 ## updated      :   2025/11/11
 ##                  Authors : Atul Kakrana,Thales H Cherubino Ribeiro, Blake C. Meyers
 ##                  Affilations  : Meyers Lab (Donald Danforth Plant Science Center, St. Louis, MO)
 ##                  License copy: Included and found at https://opensource.org/licenses/Artistic-2.0
 #### IMPORTS ##############################################
+import phasis.runtime as rt
 import os
 import sys
 import threading
@@ -45,6 +46,7 @@ from matplotlib.patches import Rectangle
 import csv
 import traceback
 from typing import List, Sequence, Dict, Tuple, Any
+from phasis.parallel import run_parallel_with_progress, make_pool, safe_worker, _compute_initial_chunk_size
 
 parser = argparse.ArgumentParser()
 reqflags        = parser.add_argument_group("required arguments")
@@ -128,6 +130,30 @@ min_Howell_score = args.min_Howell_score
 concat_libs = args.concat_libs
 outdir = args.outdir
 
+# ---- Phase-2 bridge: mirror CLI config into phasis.runtime (do not remove legacy globals) ----
+rt.libs = libs
+rt.reference = reference
+rt.norm = norm
+rt.norm_factor = norm_factor
+rt.maxhits = maxhits
+rt.runtype = runtype
+rt.mindepth = mindepth
+rt.uniqueRatioCut = uniqueRatioCut
+rt.max_complexity = max_complexity
+rt.mismat = mismat
+rt.libformat = libformat
+rt.phase = phase
+rt.clustbuffer = clustbuffer
+rt.phasisScoreCutoff = phasisScoreCutoff
+rt.minClusterLength = minClusterLength
+rt.cores = cores
+rt.classifier = classifier
+rt.steps = steps
+rt.class_cluster_file = class_cluster_file
+rt.min_Howell_score = min_Howell_score
+rt.concat_libs = concat_libs
+rt.outdir = outdir
+
 if not outdir or outdir == "{phase}_results":
     outdir = f"{phase}_results"
 
@@ -147,6 +173,8 @@ if steps not in ['both', 'cfind', 'class']:
 if phase > 21:
     window_len = 26
     sliding = 8
+    rt.window_len = window_len
+    rt.sliding = sliding
 
     # Clamp phasisScoreCutoff to [250, 300] for longer phasing
     _min_cutoff, _max_cutoff = 250, 300
@@ -163,6 +191,8 @@ if phase > 21:
 else:
     window_len = 23
     sliding = 5
+    rt.window_len = window_len
+    rt.sliding = sliding
 
 # === Phase II cache and naming helpers (concat-aware, param-aware, ConfigParser-safe) ===
 from hashlib import md5 as _md5
@@ -251,206 +281,7 @@ DOMSIZE_CUT     = 0.50          ## among all sRNAs, the user defined size should
 WINDOW_SIZE     = 15            ## Arbitrary window size;
                                 ## alternatively you can compute max phases from start and end coords
 ###########################################################
-def make_pool(nworkers: int):
-    """
-    Pool with safer defaults to limit RAM spikes.
-    - maxtasksperchild=1 curbs per-worker memory growth
-    - single-threaded BLAS via env vars
-    - prefer 'fork' context on POSIX
-    """
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-    ctx = multiprocessing.get_context("fork") if hasattr(multiprocessing, "get_context") else multiprocessing
-    return ctx.Pool(processes=int(max(1, nworkers)), maxtasksperchild=1)
-
-def safe_worker(args):
-    """Run func(arg), catching exceptions; return RuntimeError sentinel on failure."""
-    func, arg = args
-    try:
-        return func(arg)
-    except Exception as e:
-        import traceback  # allowed here (small, unavoidable for nice trace)
-        return RuntimeError(f"Error in {func.__name__} with arg={arg}: {e}\n{traceback.format_exc()}")
-
-def _compute_initial_chunk_size(n_data: int, ncores_local: int, unit: str, min_chunk: int, batch_factor: float):
-    print(f"batch factor set to {batch_factor}")
-    if unit == "lib":
-        worker_cap_for_lib = 20  # conservative start for lib-level work
-        return min(ncores_local, worker_cap_for_lib) or 1
-    if n_data <= ncores_local:
-        print("n_data <= ncores_local: return 1")
-    #    return 1
-    n_batches = int(ncores_local * batch_factor) or 1
-    print(f"n_data is {n_data}")
-    print(f"n_batches set to {n_batches}")
-    chunk_size = max(min_chunk, int(n_data / n_batches), int(ncores_local))
-    print(f" Initial chunk_size set to {chunk_size}")
-    if n_data > 300:
-        print("n_data > 300")
-        max_chunk_size = max(min_chunk, int(ncores_local))
-        chunk_size = max(chunk_size, max_chunk_size)
-        print(f" Initial chunk_size set to {chunk_size}")
-    return max(1, chunk_size)
-
-def run_parallel_with_progress(
-    func,
-    data,
-    desc=None,
-    min_chunk=1,
-    batch_factor=0.1,
-    unit="lib",
-    on_result=None,        # Optional: callable(result) -> None (avoid storing results)
-    return_results=True    # If False and on_result provided, we won’t keep a results list
-):
-    """
-    Parallel, streaming, and adaptive:
-      - Streams results via imap_unordered (low peak memory).
-      - On any pool failure, automatically retries the current slice with
-        smaller (chunk_size, nworkers): [proposed] -> 10 -> 5 -> 1; workers n->8->4->2->1.
-      - maxtasksperchild=1 to fight per-worker RSS growth.
-      - BLAS single-threaded to avoid hidden fan-out.
-
-    Tips:
-      * If results are large, pass an `on_result` consumer and set return_results=False.
-      * Keep `chunksize=1` to avoid big internal queues in the pool.
-    """
-    global ncores
-
-    n_data = len(data)
-    if n_data == 0:
-        return []
-
-    if ncores is None or ncores <= 0:
-        ncores = multiprocessing.cpu_count()
-
-    # Initial chunk size & workers
-    chunk_size = _compute_initial_chunk_size(n_data, ncores, unit, min_chunk, batch_factor)
-    print(f"initial chunk size set to {chunk_size}")
-    nworkers = min(ncores, chunk_size) or 1
-
-    # Decide whether to accumulate results or stream-only
-    keep_results = (on_result is None) or return_results
-    results = [] if keep_results else None
-
-    i = 0
-    with tqdm(total=n_data, desc=desc, unit=unit) as pbar:
-        while i < n_data:
-            start = i
-            end = min(i + chunk_size, n_data)
-            proposed = end - start if end > start else 1
-
-            # Build retry ladder for sizes
-            try_sizes = []
-            for s in (proposed, 16, 12, 10, 8, 4, 2, 1):
-                s = int(max(1, min(s, n_data - start)))
-                if s not in try_sizes:
-                    try_sizes.append(s)
-
-            slice_completed = False
-            last_exception = None
-
-            for local_chunk_size in try_sizes:
-                end = min(start + local_chunk_size, n_data)
-                chunk = data[start:end]
-
-                # Worker trials, decreasing
-                worker_trials = []
-                for w in (nworkers,16, 12, 10, 8, 4, 2, 1):
-                    w = int(max(1, min(w, local_chunk_size, ncores)))
-                    if w not in worker_trials:
-                        worker_trials.append(w)
-
-                for nw in worker_trials:
-                    # Try streaming this chunk with nw workers
-                    try:
-                        with make_pool(nw) as pool:
-                            # Stream results; avoid big intermediate lists
-                            for res in pool.imap_unordered(safe_worker, ((func, arg) for arg in chunk), chunksize=1):
-                                if isinstance(res, RuntimeError):
-                                    # Retry failed item serially for deterministic logging
-                                    idx = None  # only for clarity; we stream, so idx is not needed
-                                    retry_res = safe_worker((func, chunk[0])) if False else res  # no-op placeholder
-                                    # The safe pattern: rerun the actual arg serially
-                                    # We don't have the arg here anymore; so re-run serially by index.
-                                    # To keep memory low, do a small serial retry immediately:
-                                    if hasattr(res, 'args') and res.args:
-                                        # We encoded arg in the message, but parsing isn't robust; better to rerun by value
-                                        pass
-                                    # Safer: ignore this and do exact serial retry below with a tiny loop:
-                                    if on_result is not None and return_results is False:
-                                        # We'll handle retry after the pool closes below
-                                        pass
-
-                                # Normal path: consume result
-                                if isinstance(res, RuntimeError):
-                                    # Serial retry for the specific arg (exactly), one by one
-                                    # Find the original arg by popping from the front—safe because chunksize=1 maps 1:1
-                                    # Here we can't know which arg it was due to unordered mapping; do explicit serial pass:
-                                    # Minimal overhead since failures should be rare.
-                                    for arg in chunk:
-                                        retry = safe_worker((func, arg))
-                                        if not isinstance(retry, RuntimeError):
-                                            if on_result: on_result(retry)
-                                            if keep_results: results.append(retry)
-                                        else:
-                                            # Still failing — log and keep the sentinel
-                                            print(f"[ERROR] Serial retry failed for arg: {arg}\n{retry}")
-                                            if on_result: on_result(retry)
-                                            if keep_results: results.append(retry)
-                                    # Break out of this chunk; move to next slice
-                                    break
-                                else:
-                                    if on_result:
-                                        on_result(res)
-                                    if keep_results:
-                                        results.append(res)
-                                    pbar.update(1)
-
-                            # If we reached here without exceptions, the chunk is done
-                            slice_completed = True
-
-                        # Adopt smaller settings if they worked
-                        if local_chunk_size < chunk_size:
-                            chunk_size = local_chunk_size
-                            print(f"[INFO] Lowering ongoing chunk size to {chunk_size}.")
-                        if nw < nworkers:
-                            nworkers = nw
-                            print(f"[INFO] Lowering worker count to {nworkers}.")
-
-                        break  # worker_trials loop
-                    except MemoryError as e:
-                        last_exception = e
-                        print(f"\n[WARN] MemoryError on slice [{start}:{end}] size={local_chunk_size}, nworkers={nw}. Trying smaller.\n")
-                    except Exception as e:
-                        last_exception = e
-                        print(f"\n[WARN] Pool error on slice [{start}:{end}] size={local_chunk_size}, nworkers={nw}: {e}\nTrying smaller.\n")
-
-                if slice_completed:
-                    # Mark progress for any remaining items in this slice (if failures were handled serially we already updated)
-                    remaining = (end - start) - 0  # all streamed accounted for
-                    if remaining > 0:
-                        pbar.update(remaining)
-                    break  # size loop
-
-            # If pool attempts all failed for this slice, do serial for this slice
-            if not slice_completed:
-                print(f"[WARN] Running slice [{start}:{end}] serially after pool failures.")
-                for arg in data[start:end]:
-                    res = safe_worker((func, arg))
-                    if on_result:
-                        on_result(res)
-                    if keep_results:
-                        results.append(res)
-                pbar.update(end - start)
-
-            # Advance window and do some housekeeping
-            i = end
-            gc.collect()
-
-    return results if keep_results else None
 
 
 def checkDependency():
@@ -6518,10 +6349,25 @@ def main(libs):
         if args.cleanup:
             cleanup()
         return None
-    
-if __name__ == '__main__':
-    #### Cores to use for analysis
-    ncores          = coreReserve(cores)
+
+def legacy_entrypoint():
+    global ncores, libs
+
+    # legacy startup sequence (same order as before)
+    ncores = coreReserve(cores)
+
+    # Step-2 bridge (parallel.py will read rt.ncores)
+    import phasis.runtime as rt
+    rt.ncores = ncores
+
     checkDependency()
-    libs            = checkLibs()
-    main(libs)
+    libs_checked = checkLibs()
+
+    # keep legacy global consistent
+    libs = libs_checked
+
+    main(libs_checked)
+
+if __name__ == "__main__":
+    legacy_entrypoint()
+
