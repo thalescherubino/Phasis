@@ -1,8 +1,7 @@
 # *Phasis* for Phased Clusters Discovery and Annotation
 
-**Version**: v5  
-**Updated**: 2024/09/16  
-**Citation**: [Preprint Copy](http://www.biorxiv.org/content/early/2017/07/03/158832.full.pdf+html)  
+**Version**: v2  
+**Updated**: 2026/01/20  
 
 **Phasis** is a parallelized tool designed for the large-scale survey of sRNA libraries. It supports:
 

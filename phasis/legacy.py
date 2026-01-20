@@ -52,151 +52,98 @@ from .cache import __all__  # make "import *" stable
 from .cache import MEM_FILE_DEFAULT
 memFile = MEM_FILE_DEFAULT
 
-parser = argparse.ArgumentParser()
-reqflags        = parser.add_argument_group("required arguments")
-#optionalflags   = parser.add_argument_group("optional arguments")
+# Ensure these exist at module scope so workers never hit NameError
+outdir = None
+phase = None
+runtype = None
 
-reqflags.add_argument('-libs',help= 'Quality controlled libraries to process',required=False, nargs='*')
-reqflags.add_argument('-reference',help= 'Genome or transcriptome reference FASTA',required=False)
+def _sync_legacy_globals_from_runtime():
+    """
+    Mirror runtime (rt.*) into legacy module globals used all over legacy.py.
+    Keep it stdlib-only and side-effect free except for assignments.
+    """
+    global outdir, phase, runtype
 
-parser.add_argument('-maxhits', default=25, type=int, help='Number of genome or transcriptome hits to be processed and passed as -k to hisat2 [default 25]', required=False)
-parser.add_argument('-runtype',  default='G', type=str, help='G: Running on whole genome | T: running on transcriptome | S: running on scaffolded genome [default G]', required=False)
-parser.add_argument('-mindepth',  default=2, type=int, help='Minimum depth of sRNA to be considered for p-value computation [default 2]', required=False)
-parser.add_argument('-force', action='store_true', help='Allow Phasis to run with resource-intensive parameter combinations, which may cause system crashes', required=False)
-parser.add_argument('-uniqueRatioCut',  default=0.2, type=float, help='The proportion of uniquely mapped reads to filter out a locus [default 0.2]', required=False)
-parser.add_argument('-max_complexity',  default=0.3, type=float, help='The max complexity value of a locus [default 0.3]', required=False)
-parser.add_argument('-mismat',  default=0, type=int, help='Number of mismatches allowed between sRNA and reference for mapping [default 0]', required=False)
-parser.add_argument('-libformat',  default='F', type=str, help='Quality controlled format: FASTA (F) or Tag count (T) [default F]', required=False)
-parser.add_argument('-phase', default=21, type=int, help="Desired phase length to use for prediction [default 21]", required=False)
-parser.add_argument('-clustbuffer', default=300, type=int, help="Maximum distance between two clusters, otherwise they will be merged [default 300]", required=False)
-parser.add_argument('-phasisScoreCutoff',default=50, type=int, help="Minimum score to report a PHAS locus [default for 21-PHAS: 50 | default for 24-PHAS: 250]", required=False)
-parser.add_argument('-minClusterLength',default=350, type=int, help="Minimum length to score a PHAS locus [default 350]", required=False)
-parser.add_argument('-cores', default=0, type=int, help="Number of cores to use for analysis. 0: for most of the free cores | INTEGER (>0): to specify exact cores to use [default 0]", required=False)
-parser.add_argument('-norm', action='store_true', help='Allow Phasis to perform read count normalization (CP10M) [default False]', required=False)
-parser.add_argument('-norm_factor', type=float, default=1e7, help='Optional: Set a specific normalization factor (default is 1e7 for CP10M)', required=False)
-parser.add_argument('-classifier',  default='KNN', type=str, help='Use a pre-trained K Nearest Neighbors classifier (KNN) | Use an unsupervised Gaussian mixture model [default KNN]', required=False)
-parser.add_argument('-cleanup', action='store_true', help='Delete intermediate directories and files (not recommended for successive runs)', required=False)
-parser.add_argument('-steps', default='both', help='run the cluster detection and classifier [default] | run only cluster detection [cfind] | run only classification [class]', required=False)
-parser.add_argument('-class_cluster_file', help='Cluster file name(s) for -steps class', nargs='*')
-parser.add_argument('-version', action='version',help = "Print the version and then quit", version='%(prog)s ' + version)
-parser.add_argument('-min_Howell_score', type=float, default=12.5, help='Minimum Phased (Howell) score', required=False)
-parser.add_argument( '--concat_libs', dest='concat_libs', action='store_true', required=False, help='Concatenate all input libraries into a single virtual library before mapping (default: off).' )
-parser.add_argument('--outdir', dest='outdir', metavar='DIR', type=str, required=False, default="{phase}_results", help='Directory to write all outputs; if omitted, defaults to {phase}_results (created if missing).')
+    # pull from runtime if present
+    if getattr(rt, "phase", None) is not None:
+        phase = rt.phase
+    if getattr(rt, "runtype", None):
+        runtype = rt.runtype
 
-args = parser.parse_args()
-
-global libs
-global reference
-global norm
-global norm_factor
-global maxhits
-global runtype
-global mindepth
-global uniqueRatioCut
-global mismat
-global libformat
-global phase
-global clustbuffer
-global phasisScoreCutoff
-global minClusterLength
-global window_len
-global sliding
-global cores
-global classifier
-global steps
-global class_cluster_file
-global max_complexity
-global ncores
-global min_Howell_score
-global concat_libs
-global outdir
- 
-libs = args.libs
-reference = args.reference
-norm = args.norm
-norm_factor = args.norm_factor
-maxhits = args.maxhits
-runtype = args.runtype
-mindepth = args.mindepth
-uniqueRatioCut = args.uniqueRatioCut
-max_complexity = args.max_complexity
-mismat = args.mismat
-libformat = args.libformat
-phase = args.phase
-clustbuffer = args.clustbuffer
-phasisScoreCutoff = args.phasisScoreCutoff
-minClusterLength = args.minClusterLength
-cores = args.cores
-classifier = args.classifier
-steps = args.steps
-class_cluster_file = args.class_cluster_file
-min_Howell_score = args.min_Howell_score
-concat_libs = args.concat_libs
-outdir = args.outdir
-
-# ---- Phase-2 bridge: mirror CLI config into phasis.runtime (do not remove legacy globals) ----
-rt.libs = libs
-rt.reference = reference
-rt.norm = norm
-rt.norm_factor = norm_factor
-rt.maxhits = maxhits
-rt.runtype = runtype
-rt.mindepth = mindepth
-rt.uniqueRatioCut = uniqueRatioCut
-rt.max_complexity = max_complexity
-rt.mismat = mismat
-rt.libformat = libformat
-rt.phase = phase
-rt.clustbuffer = clustbuffer
-rt.phasisScoreCutoff = phasisScoreCutoff
-rt.minClusterLength = minClusterLength
-rt.cores = cores
-rt.classifier = classifier
-rt.steps = steps
-rt.class_cluster_file = class_cluster_file
-rt.min_Howell_score = min_Howell_score
-rt.concat_libs = concat_libs
-rt.outdir = outdir
-
-if not outdir or outdir == "{phase}_results":
-    outdir = f"{phase}_results"
-
-# normalize + create
-outdir = os.path.abspath(os.path.expanduser(outdir))
-os.makedirs(outdir, exist_ok=True)
-
-if (classifier != "KNN") and (classifier != "GMM"):
-    print("\nERROR: Wrong classifier option")
-    sys.exit()
-else: pass
-
-if steps not in ['both', 'cfind', 'class']:
-    print("Error: Invalid value for -steps. Possible values: 'both', 'cfind', 'class'")
-    exit(1)
-
-if phase > 21:
-    window_len = 26
-    sliding = 8
-    rt.window_len = window_len
-    rt.sliding = sliding
-
-    # Clamp phasisScoreCutoff to [250, 300] for longer phasing
-    _min_cutoff, _max_cutoff = 250, 300
-    _orig = phasisScoreCutoff
-    if phasisScoreCutoff < _min_cutoff:
-        phasisScoreCutoff = _min_cutoff
-        print(f"[INFO] phase={phase} > 21: phasisScoreCutoff raised from {_orig} to {phasisScoreCutoff} (min {_min_cutoff}).")
-    elif phasisScoreCutoff > _max_cutoff:
-        phasisScoreCutoff = _max_cutoff
-        print(f"[INFO] phase={phase} > 21: phasisScoreCutoff lowered from {_orig} to {phasisScoreCutoff} (max {_max_cutoff}).")
+    if getattr(rt, "outdir", None):
+        outdir = rt.outdir
     else:
-        print(f"[INFO] phase={phase} > 21: phasisScoreCutoff kept at {phasisScoreCutoff} (within [{_min_cutoff}, {_max_cutoff}]).")
+        # last-resort default if runtime wasn't populated (shouldn't happen once CLI is fixed)
+        ph = phase if phase is not None else 21
+        outdir = f"{ph}_results"
+        rt.outdir = outdir  # keep runtime consistent
 
-else:
-    window_len = 23
-    sliding = 5
-    rt.window_len = window_len
-    rt.sliding = sliding
+# ---- legacy config is populated from phasis.runtime (spawn-safe) ----
+
+def sync_from_runtime() -> None:
+    """
+    Populate legacy module globals from phasis.runtime.
+    Call this exactly once at the start of legacy_entrypoint().
+    """
+    global libs, reference, norm, norm_factor, maxhits, runtype, mindepth
+    global uniqueRatioCut, max_complexity, mismat, libformat, phase
+    global clustbuffer, phasisScoreCutoff, minClusterLength, window_len, sliding
+    global cores, classifier, steps, class_cluster_file, min_Howell_score
+    global concat_libs, outdir, memFile
+
+    libs = rt.libs
+    reference = rt.reference
+    norm = rt.norm
+    norm_factor = rt.norm_factor
+    maxhits = rt.maxhits
+    runtype = rt.runtype
+    mindepth = rt.mindepth
+    uniqueRatioCut = rt.uniqueRatioCut
+    max_complexity = rt.max_complexity
+    mismat = rt.mismat
+    libformat = rt.libformat
+    phase = rt.phase
+    clustbuffer = rt.clustbuffer
+    phasisScoreCutoff = rt.phasisScoreCutoff
+    minClusterLength = rt.minClusterLength
+    cores = rt.cores
+    classifier = rt.classifier
+    steps = rt.steps
+    class_cluster_file = rt.class_cluster_file
+    min_Howell_score = rt.min_Howell_score
+    concat_libs = rt.concat_libs
+    outdir = rt.outdir
+    window_len = rt.window_len
+    sliding = rt.sliding
+
+    # Ensure outdir exists even if someone calls legacy directly
+    if outdir:
+        outdir_abs = os.path.abspath(os.path.expanduser(outdir))
+        if outdir_abs != outdir:
+            outdir = outdir_abs
+            rt.outdir = outdir_abs
+        os.makedirs(outdir, exist_ok=True)
+
+    # Anchor memFile under outdir (prevents collisions across runs)
+    # Use runtime override if present; otherwise set a default.
+    mem_override = getattr(rt, "memFile", None)
+    if mem_override:
+        memFile = mem_override
+    else:
+        if outdir:
+            memFile = os.path.join(outdir, MEM_FILE_DEFAULT)
+        else:
+            memFile = MEM_FILE_DEFAULT
+        rt.memFile = memFile
+
+    # Fallbacks (should already be set by CLI, but keep legacy robust)
+    if window_len is None or sliding is None:
+        if phase and phase > 21:
+            window_len, sliding = 26, 8
+        else:
+            window_len, sliding = 23, 5
+        rt.window_len = window_len
+        rt.sliding = sliding
 
 
 def checkLibs():
@@ -931,7 +878,8 @@ def mapper(aninput):
     Function to map individual files using HISAT2 and sort output with Samtools.
     Removes headers after sorting.
     '''
-    alib, genoIndex, nspread, maxhits = aninput
+    #alib, genoIndex, nspread, maxhits = aninput
+    alib, genoIndex, nspread, maxhits, runtype = aninput
     ## Output file names
     asam_temp = f"{alib.rpartition('.')[0]}.temp.sam"  # Temporary file with headers
     asam_sorted = f"{alib.rpartition('.')[0]}.sorted.sam"  # Sorted file with headers
@@ -1058,7 +1006,8 @@ def mapprocess(libs, genoIndex):
     if libs_to_map:
         print("Libraries to be mapped: %s" % (', '.join(libs_to_map)))
         nproc, nspread = optimize(ncores, len(libs_to_map))
-        rawinputs = [(alib, genoIndex, nspread, maxhits) for alib in libs_to_map]
+        #rawinputs = [(alib, genoIndex, nspread, maxhits) for alib in libs_to_map]
+        rawinputs = [(alib, genoIndex, nspread, maxhits, runtype) for alib in libs_to_map]
         PPBalance(mapper, rawinputs)
 
         # Record MD5s: SAMs and FASTAs that were (re)mapped
@@ -2792,6 +2741,38 @@ def optimize(ncores,nfiles):
     print("#### %s computing core(s) assigned to each lib #\n" % (str(nspread)))
     return nproc,nspread
 
+'''def PPBalance(module, alist):
+    print("##    FN PPBalance   ######")
+    n_workers = int(globals().get('nproc', 1))
+    if n_workers < 1:
+        n_workers = 1
+    # Linux default context; no need to specify
+    pool = multiprocessing.Pool(n_workers)
+    errors = []
+    try:
+        results = []
+        for i, res in enumerate(pool.imap_unordered(module, alist), 1):
+            results.append(res)
+        pool.close()
+        pool.join()
+        return results
+    except Exception as e:
+        print(f"[PPBalance] Error in parallel processing: {e}")
+        traceback.print_exc()
+        pool.terminate()
+        pool.join()
+        errors.append(e)
+        raise
+    finally:
+        try:
+            pool.terminate()
+            pool.join()
+        except Exception:
+            pass
+    if errors:
+        print("[PPBalance] Some jobs failed, see logs above.")
+'''
+
 def PPBalance(module, alist):
     print("##    FN PPBalance   ######")
     n_workers = int(globals().get('nproc', 1))
@@ -3204,21 +3185,42 @@ def ensure_mergedClusterDict(phase: str):
 MERGED_REVERSE_BUILT = False
 
 def _ensure_reverse_index() -> dict:
-    mcd = globals().get("mergedClusterDict", {}) or {}
+    """
+    Ensure a usable reverse index exists and is visible under:
+      - rt.mergedClusterReverse
+      - globals()['MERGED_CLUSTER_REVERSE']
+      - globals()['mergedClusterReverse']  (compat)
+    """
+    # 1) Prefer runtime if already present
+    if isinstance(getattr(rt, "mergedClusterReverse", None), dict) and rt.mergedClusterReverse:
+        globals()["MERGED_CLUSTER_REVERSE"] = rt.mergedClusterReverse
+        globals()["mergedClusterReverse"] = rt.mergedClusterReverse
+        return rt.mergedClusterReverse
+
+    # 2) If legacy global exists, ensure alias + runtime
     rev = globals().get("MERGED_CLUSTER_REVERSE")
-    if not rev:
-        rev = {}
-        for u, members in mcd.items():
-            for cid in members:
-                key = _normalize_cluster_id_for_lookup(cid)
-                if key:
-                    rev[key] = str(u)
-                # (optional forgiving keys)
-                raw = str(cid).strip()
-                if raw:
-                    rev[raw] = str(u)
-        globals()["MERGED_CLUSTER_REVERSE"] = rev
-        globals()["mergedClusterReverse"]  = rev  # compat alias
+    if isinstance(rev, dict) and rev:
+        globals()["mergedClusterReverse"] = rev
+        rt.mergedClusterReverse = rev
+        return rev
+
+    # 3) Build from mergedClusterDict
+    mcd = None
+    if isinstance(getattr(rt, "mergedClusterDict", None), dict) and rt.mergedClusterDict:
+        mcd = rt.mergedClusterDict
+    else:
+        mcd = globals().get("mergedClusterDict") or {}
+
+    rev = {}
+    for u, members in (mcd or {}).items():
+        for cid in members or []:
+            s = str(cid).strip()
+            if s:
+                rev[s] = str(u)
+
+    globals()["MERGED_CLUSTER_REVERSE"] = rev
+    globals()["mergedClusterReverse"] = rev
+    rt.mergedClusterReverse = rev
     return rev
 
 def getUniversalID(clusterID):
@@ -3603,25 +3605,6 @@ def ensure_mergedClusterDict(phase: str):
         g["mergedClusterDict"] = {}
         return g["mergedClusterDict"]
 
-# Optional: reverse index for O(1) member->universal lookups
-def _ensure_reverse_index():
-    global _MERGED_REVERSE_BUILT
-    if _MERGED_REVERSE_BUILT:
-        return
-    mcd = globals().get("mergedClusterDict") or {}
-    rev = {}
-    for uid, members in mcd.items():
-        uid_s = str(uid).strip()
-        rev[uid_s] = uid_s  # universal as member too
-        for m in members:
-            rev[str(m).strip()] = uid_s
-    globals()["mergedClusterReverse"] = rev
-    _MERGED_REVERSE_BUILT = True
-
-# If you use a glued prefix like "ALL_LIBS.21-PHAS.candidate.clusters<real_id>"
-import re
-
-
 # === Howell score safety: clamp cycles to [0, 10] ===
 def _howell_clamp_cycles_10(num_cycles: int) -> int:
     try:
@@ -3647,36 +3630,52 @@ def getUniversalID(clusterID):
     """
     Map a raw clusterID to its universal ID using mergedClusterDict.
     Tries exact, then prefix-stripped, then reverse index.
+    Runtime-first, legacy-compatible.
     """
-    ensure_mergedClusterDict(phase)   # make sure dict is loaded
-    _ensure_reverse_index()
+    ensure_mergedClusterDict(phase)        # make sure dict is loaded/built
+    rev = _ensure_reverse_index()          # must return a dict (and populate rt.*)
 
     cid_raw = str(clusterID).strip()
     cid_stripped = _strip_fileprefix_from_id(cid_raw, phase=phase)
 
-    mcd = globals().get("mergedClusterDict", {})
-    if cid_raw in mcd:      # already universal
+    # Runtime-first mergedClusterDict (fallback to legacy global if needed)
+    mcd = getattr(rt, "mergedClusterDict", None)
+    if not isinstance(mcd, dict) or not mcd:
+        mcd = globals().get("mergedClusterDict", {}) or {}
+
+    # If already universal (present as a key in mergedClusterDict), return it
+    if cid_raw in mcd:
         return cid_raw
     if cid_stripped in mcd:
         return cid_stripped
 
-    rev = globals().get("mergedClusterReverse", {})
+    # Otherwise resolve via reverse map
     if cid_raw in rev:
         return rev[cid_raw]
     if cid_stripped in rev:
         return rev[cid_stripped]
+
     return None
 
 
 # --- helpers ---------------------------------------------------------------
 
 def _set_reverse_merged_map(mcd: dict) -> None:
-    """Cache clusterID -> universalID reverse map in globals()."""
+    """Cache clusterID -> universalID reverse map in both legacy globals and runtime."""
     rev = {}
-    for u, members in mcd.items():
-        for cid in members:
-            rev[str(cid)] = str(u)
+    for u, members in (mcd or {}).items():
+        for cid in members or []:
+            s = str(cid).strip()
+            if s:
+                rev[s] = str(u)
+
+    # legacy globals
     globals()["MERGED_CLUSTER_REVERSE"] = rev
+    globals()["mergedClusterReverse"] = rev  # compat alias
+
+    # runtime (single source of truth going forward)
+    rt.mergedClusterDict = mcd
+    rt.mergedClusterReverse = rev
 
 
 def _load_simple_tab_dict(path: str) -> dict:
@@ -3891,102 +3890,192 @@ def build_and_save_phas_clusters(allClusters: pd.DataFrame) -> pd.DataFrame:
     Skips recomputation if the output file exists and matches the hash stored in memFile.
     Robust to accidentally receiving the 6-col merged-candidates frame: falls back to
     {phase}_processed_clusters.tab (20-col per-read/per-alignment schema).
+
+    Runtime-first:
+      - prefers phasis.runtime for phase/memFile/concat_libs/outdir (single source of truth)
+      - falls back to legacy globals if runtime fields are unset
     """
     print("### Step: Build PHAS clusters per (chromosome, library) — parallel ###")
 
-    output_file = phase2_basename('PHAS_to_detect.tab')
+    # ---- runtime-first knobs (fallback to legacy globals) ----
+    try:
+        import phasis.runtime as rt
+    except Exception:
+        rt = None
 
-    # --- Early hash check ---
+    phase_local = (getattr(rt, "phase", None) if rt else None) or globals().get("phase")
+    memfile_local = (getattr(rt, "memFile", None) if rt else None) or globals().get("memFile")
+    concat_local = (getattr(rt, "concat_libs", None) if rt else None)
+    if concat_local is None:
+        concat_local = globals().get("concat_libs", False)
+
+    output_file = phase2_basename("PHAS_to_detect.tab")
+
+    # ---- required 20-col schema (ORDER MATTERS) ----
+    required_20 = [
+        "alib", "clusterID", "chromosome", "strand", "pos", "len", "hits", "abun",
+        "pval_h_f", "N_f", "X_f", "pval_r_f", "pval_corr_f",
+        "pval_h_r", "N_r", "X_r", "pval_r_r", "pval_corr_r",
+        "tag_id", "tag_seq",
+    ]
+    required_20_set = set(required_20)
+
+    # ---- cache config (memFile might not exist yet; don't let that break the run) ----
     config = configparser.ConfigParser()
     config.optionxform = str
-    config.read(memFile)
     section_name = "PHAS_TO_DETECT"
+
+    try:
+        if memfile_local and os.path.isfile(memfile_local):
+            config.read(memfile_local)
+    except Exception:
+        pass
+
     if not config.has_section(section_name):
-        config.add_section(section_name)
+        try:
+            config.add_section(section_name)
+        except Exception:
+            pass
 
+    # ---- Early hash check ----
     if os.path.isfile(output_file):
-        _, current_md5 = getmd5(output_file)
-        previous_md5 = config[section_name].get(output_file)
-        if previous_md5 and previous_md5 == current_md5:
-            print(f"  - Output up-to-date (hash match). Skipping processing: {output_file}")
-            df = pd.read_csv(output_file, sep="\t")
-            numeric_allowlist = {
-                "pos","len","hits","abun",
-                "pval_h_f","N_f","X_f","pval_r_f","pval_corr_f",
-                "pval_h_r","N_r","X_r","pval_r_r","pval_corr_r"
-            }
-            for col in numeric_allowlist.intersection(df.columns):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            return df
+        try:
+            _, current_md5 = getmd5(output_file)
+            previous_md5 = None
+            try:
+                previous_md5 = config[section_name].get(output_file)
+            except Exception:
+                previous_md5 = None
 
-    # --- Accept only the 20-col per-read schema; else load the processed tab ---
-    required_20 = {
-        "alib","clusterID","chromosome","strand","pos","len","hits","abun",
-        "pval_h_f","N_f","X_f","pval_r_f","pval_corr_f","pval_h_r","N_r",
-        "X_r","pval_r_r","pval_corr_r","tag_id","tag_seq"
-    }
+            if previous_md5 and previous_md5 == current_md5:
+                print(f"  - Output up-to-date (hash match). Skipping processing: {output_file}")
+                df = pd.read_csv(output_file, sep="\t")
 
-    if not (isinstance(allClusters, pd.DataFrame) and required_20.issubset(set(allClusters.columns))):
-        allClusters = load_processed_clusters_fallback(phase)
+                numeric_allowlist = {
+                    "pos", "len", "hits", "abun",
+                    "pval_h_f", "N_f", "X_f", "pval_r_f", "pval_corr_f",
+                    "pval_h_r", "N_r", "X_r", "pval_r_r", "pval_corr_r",
+                }
+                for col in numeric_allowlist.intersection(df.columns):
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # --- If still empty, bail cleanly ---
+                return df
+        except Exception:
+            pass
+
+    # ---- Accept only the 20-col per-read schema; else load the processed tab ----
+    if not (isinstance(allClusters, pd.DataFrame) and required_20_set.issubset(set(allClusters.columns))):
+        allClusters = load_processed_clusters_fallback(phase_local)
+
+    # ---- If still empty, bail cleanly ----
     if allClusters is None or getattr(allClusters, "empty", True):
         print("  - Found 0 (chromosome, library) groups (empty input). Returning empty DataFrame.")
-        return pd.DataFrame(columns=list(required_20) + ["identifier"])
+        return pd.DataFrame(columns=required_20 + ["identifier"])
 
-    # --- Ensure grouping columns exist / normalize ---
+    # ---- Ensure grouping columns exist / normalize ----
     if "chromosome" not in allClusters.columns and "chr" in allClusters.columns:
         allClusters = allClusters.rename(columns={"chr": "chromosome"})
-    if "alib" not in allClusters.columns:
-        try:
-            if concat_libs:
-                allClusters["alib"] = "ALL_LIBS"
-            else:
-                print("[WARN] 'alib' column missing and not in concat mode; returning empty DataFrame.")
-                return pd.DataFrame(columns=list(required_20) + ["identifier"])
-        except NameError:
-            print("[WARN] 'alib' column missing; returning empty DataFrame.")
-            return pd.DataFrame(columns=list(required_20) + ["identifier"])
 
-    # --- Group → ((chromosome, library), loci_list) ---
+    if "alib" not in allClusters.columns:
+        if concat_local:
+            allClusters = allClusters.copy()
+            allClusters["alib"] = "ALL_LIBS"
+        else:
+            print("[WARN] 'alib' column missing and not in concat mode; returning empty DataFrame.")
+            return pd.DataFrame(columns=required_20 + ["identifier"])
+
+    # ---- Enforce EXACT 20-column payload (drop extras like 'identifier') ----
+    if not required_20_set.issubset(set(allClusters.columns)):
+        allClusters = load_processed_clusters_fallback(phase_local)
+        if allClusters is None or getattr(allClusters, "empty", True):
+            print("  - Input invalid and fallback empty; returning empty DataFrame.")
+            return pd.DataFrame(columns=required_20 + ["identifier"])
+
+    allClusters = allClusters.loc[:, required_20].copy()
+
+    # ---- Ensure universal ID mapping is READY BEFORE forking/spawning ----
+    # This is the critical “current issue” fix: workers were dropping everything because
+    # getUniversalID() could not resolve clusterIDs -> universal IDs.
+    try:
+        ensure_mergedClusterDict(phase_local)
+    except Exception:
+        pass
+
+    try:
+        _ensure_reverse_index()
+    except Exception:
+        pass
+
+    # Quick sanity check (cheap) — if mapping fails completely, parallel work will be empty
+    try:
+        sample = allClusters["clusterID"].astype(str).head(50).tolist()
+        ok = sum(1 for cid in sample if getUniversalID(cid) is not None)
+        if ok == 0 and sample:
+            print("[WARN] Universal ID mapping returned 0/50 hits in parent process. "
+                  "Workers will likely return empty. Check mergedClusterDict/reverse map wiring.")
+    except Exception:
+        pass
+
+    # ---- Group → ((chromosome, library), loci_list) ----
     cluster_groups = [
         ((chromosome, alib), df.values.tolist())
-        for (chromosome, alib), df in allClusters.groupby(['chromosome', 'alib'], sort=False)
+        for (chromosome, alib), df in allClusters.groupby(["chromosome", "alib"], sort=False)
     ]
     print(f"  - Found {len(cluster_groups)} (chromosome, library) groups")
 
     if not cluster_groups:
         print("  - No groups to process. Returning empty DataFrame.")
-        return pd.DataFrame(columns=list(required_20) + ["identifier"])
+        return pd.DataFrame(columns=required_20 + ["identifier"])
 
     processed_results = run_parallel_with_progress(
         process_phas_cluster_group,
         cluster_groups,
         desc="Building PHAS cluster groups",
         min_chunk=1,
-        unit="lib-chr"
+        unit="lib-chr",
     )
 
     if not processed_results:
         print("  - Worker returned no results. Returning empty DataFrame.")
-        return pd.DataFrame(columns=list(required_20) + ["identifier"])
+        return pd.DataFrame(columns=required_20 + ["identifier"])
 
-    processed_results = [r for r in processed_results if isinstance(r, pd.DataFrame) and not r.empty]
-    if not processed_results:
+    # Surface worker failures if they were wrapped
+    worker_errors = [r for r in processed_results if isinstance(r, RuntimeError)]
+    if worker_errors:
+        print("[WARN] One or more worker tasks failed; filtering to successful results. First error:")
+        print(worker_errors[0])
+
+    processed_frames = [r for r in processed_results if isinstance(r, pd.DataFrame) and not r.empty]
+    if not processed_frames:
         print("  - All worker results empty. Returning empty DataFrame.")
-        return pd.DataFrame(columns=list(required_20) + ["identifier"])
+        return pd.DataFrame(columns=required_20 + ["identifier"])
 
-    clusters_data = pd.concat(processed_results, ignore_index=True)
+    clusters_data = pd.concat(processed_frames, ignore_index=True)
 
+    # ---- Write + update md5 cache (best effort) ----
     clusters_data.to_csv(output_file, sep="\t", encoding="utf-8", index=False)
+
     if os.path.isfile(output_file):
-        _, new_md5 = getmd5(output_file)
-        config[section_name][output_file] = new_md5
-        with open(memFile, "w") as fh:
-            config.write(fh)
-        print(f"  - Wrote {output_file} (md5: {new_md5})")
+        try:
+            _, new_md5 = getmd5(output_file)
+            try:
+                config[section_name][output_file] = new_md5
+            except Exception:
+                pass
+
+            try:
+                if memfile_local:
+                    with open(memfile_local, "w") as fh:
+                        config.write(fh)
+            except Exception:
+                pass
+
+            print(f"  - Wrote {output_file} (md5: {new_md5})")
+        except Exception:
+            print(f"  - Wrote {output_file}")
 
     return clusters_data
+
 
 def process_phas_cluster_group(group):
     """
@@ -5388,7 +5477,10 @@ def plot_report_heat_map(phasis_result_df, plot_type):
     cax2.spines['left'].set_visible(False)
 
     # Create a custom color bar with specific text legends for each color group
-    cbar = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap), cax=cax2, orientation='vertical')
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=Normalize(vmin=0, vmax=2))
+    sm.set_array([])
+
+    cbar = plt.colorbar(sm, cax=cax2, orientation="vertical", ticks=[0, 1, 2])
     cbar.set_ticklabels(["Not detected", r'non-$\it{PHAS}$ cluster', r'$\it{PHAS}$'])
     ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=8)
 
@@ -5682,15 +5774,56 @@ def _parse_identifiers_and_alib(features: pd.DataFrame):
     alib_ids = [re.sub(rf"\.{re.escape(str(phase))}-PHAS\.candidate$", "", x) for x in alib_src]
     return achr, start, end, alib_ids
 
-def _plot_wrapper(args):
-    fn, df, mname = args
+def _plot_wrapper(job):
+    """
+    Worker-safe plot wrapper.
+    Accepts:
+      - (fn, df, mname)                      [legacy format]
+      - (fn, df, mname, job_outdir, job_phase)  [spawn-safe format]
+    """
+    # Unpack both formats
+    if len(job) == 3:
+        fn, df, mname = job
+        job_outdir = None
+        job_phase = None
+    elif len(job) == 5:
+        fn, df, mname, job_outdir, job_phase = job
+    else:
+        raise ValueError(f"Unexpected plot job tuple size: {len(job)}")
+
+    # Ensure globals exist in worker (spawn/fork safe)
+    global outdir, phase
+    if job_outdir is not None:
+        outdir = job_outdir
+    if job_phase is not None:
+        phase = job_phase
+
+    # If still missing, pull from runtime as fallback
+    if outdir is None or phase is None:
+        try:
+            import phasis.runtime as rt
+            if outdir is None:
+                outdir = getattr(rt, "outdir", outdir)
+            if phase is None:
+                phase = getattr(rt, "phase", phase)
+        except Exception:
+            pass
+
     return fn(df, mname)
 
+
 def _finalize_and_write_results(method_name: str, features: pd.DataFrame):
+    _sync_legacy_globals_from_runtime() 
+    
     """
     Build result dataframe (all clusters + filtered PHAS),
     write standardized outputs, run 3 tree plots in parallel, and write GFF.
     """
+    try:
+        os.makedirs(outdir, exist_ok=True)
+    except Exception:
+        pass
+
     # Decompose identifiers and clean alib tags
     achr, start, end, alib_ids = _parse_identifiers_and_alib(features)
 
@@ -5769,13 +5902,12 @@ def _finalize_and_write_results(method_name: str, features: pd.DataFrame):
 
     # --- Run the 3 plots in parallel (each on a core) ---
     plot_jobs = [
-        (plot_report_heat_map, all_df, method_name),
-        (plot_phasAbundance_heat_map, all_df, method_name),
-        (plot_totalAbundance_heat_map, all_df, method_name),
+    (plot_report_heat_map, all_df, method_name, outdir, phase),
+    (plot_phasAbundance_heat_map, all_df, method_name, outdir, phase),
+    (plot_totalAbundance_heat_map, all_df, method_name, outdir, phase),
     ]
-    with Pool(processes=min(3, cpu_count())) as p:
+    with make_pool(min(3, cpu_count()), kind="plot") as p:
         p.map(_plot_wrapper, plot_jobs)
-
     print(f"  - Wrote: {all_out}, {calls_out}, and {gff_out}")
 
 def KNN_phas_clustering(features: pd.DataFrame):
@@ -6053,28 +6185,30 @@ def main(libs):
         elif classifier == "KNN":
             KNN_phas_clustering(features)
 
-        if args.cleanup:
+        if getattr(rt, "cleanup", False):
             cleanup()
         return None
 
 def legacy_entrypoint():
     global ncores, libs
 
+    sync_from_runtime()
+
     # legacy startup sequence (same order as before)
     ncores = coreReserve(cores)
 
     # Step-2 bridge (parallel.py will read rt.ncores)
-    import phasis.runtime as rt
     rt.ncores = ncores
 
     checkDependency()
     libs_checked = checkLibs()
 
-    # keep legacy global consistent
+    # keep legacy + runtime consistent
     libs = libs_checked
+    rt.libs = libs_checked
 
     main(libs_checked)
-
+    
 if __name__ == "__main__":
     legacy_entrypoint()
 

@@ -1,4 +1,4 @@
-import os, multiprocessing, gc, traceback
+import os, multiprocessing, gc, traceback, sys
 from tqdm import tqdm
 import phasis.runtime as rt
 def run_parallel_with_progress(
@@ -176,21 +176,105 @@ def _compute_initial_chunk_size(n_data: int, ncores_local: int, unit: str, min_c
         print(f" Initial chunk_size set to {chunk_size}")
     return max(1, chunk_size)
 
-def make_pool(nworkers: int):
+
+def _infer_runtime_snapshot_path():
+    # Prefer an explicit snapshot path if runtime.py defines one
+    p = getattr(rt, "runtime_snapshot", None)
+    if p and os.path.isfile(p):
+        return p
+
+    # Fallback: look in run_dir, then CWD
+    run_dir = getattr(rt, "run_dir", None) or os.getcwd()
+    cand = os.path.join(run_dir, ".phasis.runtime.json")
+    if os.path.isfile(cand):
+        return cand
+
+    cand = os.path.join(os.getcwd(), ".phasis.runtime.json")
+    if os.path.isfile(cand):
+        return cand
+
+    return None
+
+
+def _pool_initializer(snapshot_path, kind):
+    # Keep BLAS single-threaded in workers
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    # Plot pools on macOS must avoid GUI backends
+    if kind == "plot":
+        os.environ.setdefault("MPLBACKEND", "Agg")
+
+    # Load runtime snapshot if available (spawn-safe)
+    try:
+        if snapshot_path and hasattr(rt, "load_snapshot"):
+            rt.load_snapshot(snapshot_path)
+    except Exception:
+        pass
+
+    # Ensure workers operate from the run directory where intermediates live
+    try:
+        rd = getattr(rt, "run_dir", None)
+        if rd:
+            os.chdir(rd)
+    except Exception:
+        pass
+
+    # Sync legacy globals from runtime if the function exists
+    try:
+        from . import legacy
+        if hasattr(legacy, "sync_from_runtime"):
+            legacy.sync_from_runtime()
+    except Exception:
+        pass
+
+
+def make_pool(nworkers: int | None = None, *, processes: int | None = None, start_method: str | None = None,
+             kind: str = "compute", snapshot_path: str | None = None):
     """
     Pool with safer defaults to limit RAM spikes.
-    - maxtasksperchild=1 curbs per-worker memory growth
-    - single-threaded BLAS via env vars
-    - prefer 'fork' context on POSIX
+
+    - BLAS threads set to 1.
+    - maxtasksperchild=1.
+    - macOS: spawn by default (safe for ObjC/matplotlib).
+    - Linux: fork by default.
+
+    NEW:
+    - Supports `processes=` kwarg as alias for nworkers.
+    - Loads runtime snapshot in workers (spawn-safe).
+    - kind="plot" sets MPLBACKEND=Agg inside workers.
     """
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-    ctx = multiprocessing.get_context("fork") if hasattr(multiprocessing, "get_context") else multiprocessing
-    return ctx.Pool(processes=int(max(1, nworkers)), maxtasksperchild=1)
+    if processes is not None:
+        nworkers = processes
+    nworkers = int(max(1, nworkers or 1))
 
+    if start_method is None:
+        start_method = "spawn" if sys.platform == "darwin" else "fork"
+
+    if snapshot_path is None:
+        snapshot_path = _infer_runtime_snapshot_path()
+
+    if hasattr(multiprocessing, "get_context"):
+        try:
+            ctx = multiprocessing.get_context(start_method)
+        except ValueError:
+            ctx = multiprocessing.get_context()
+    else:
+        ctx = multiprocessing
+
+    return ctx.Pool(
+        processes=nworkers,
+        maxtasksperchild=1,
+        initializer=_pool_initializer,
+        initargs=(snapshot_path, kind),
+    )
 
 def safe_worker(args):
     """Run func(arg), catching exceptions; return RuntimeError sentinel on failure."""
