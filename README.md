@@ -48,6 +48,37 @@ phasis -h
 
 ---
 
+## Running example (maize tag-counts from GEO)
+
+This end-to-end example downloads **tag-count** libraries from GEO and the **B73 RefGen v2 (AGPv2)** genome, then runs Phasis for **21-PHAS** and **24-PHAS**.
+
+```bash
+mkdir -p phasis_example
+cd phasis_example
+
+# Retrieve from GEO the tabular delimited small RNA accumulation files (tag-count)
+wget "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSM3466697&format=file&file=GSM3466697%5F7570%5Fchopped%2Etxt%2Egz" -O sTP_dcl5_1_2.0.tag.gz
+wget "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSM4180401&format=file&file=GSM4180401%5FTP%5FW23%5F2%5F0%5F1%5Fchopped%2Etxt%2Egz" -O W23_2.0_1.tag.gz
+wget "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSM4180402&format=file&file=GSM4180402%5FTP%5FW23%5F2%5F0%5F2%5Fchopped%2Etxt%2Egz" -O W23_2.0_2.tag.gz
+wget "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSM3466699&format=file&file=GSM3466699%5F7569%5Fchopped%2Etxt%2Egz" -O sTR_dcl5_1_2.0.tag.gz
+
+# Download the maize genome B73_RefGen_v2/AGPv2
+wget https://download.maizegdb.org/B73_RefGen_v2/B73_RefGen_v2.fa.gz
+
+# Decompress files
+gzip -d B73_RefGen_v2.fa.gz
+gzip -d sTR_dcl5_1_2.0.tag.gz
+gzip -d W23_2.0_2.tag.gz
+gzip -d sTP_dcl5_1_2.0.tag.gz
+gzip -d W23_2.0_1.tag.gz
+
+# Detect 21-PHAS
+phasis -mindepth 1 -phase 21 -libformat T -classifier KNN -reference B73_RefGen_v2.fa -cores 12 -maxhits 25   -libs sTR_dcl5_1_2.0.tag W23_2.0_2.tag sTP_dcl5_1_2.0.tag W23_2.0_1.tag
+
+# Detect 24-PHAS (same run directory allows reuse of the HISAT2 index)
+phasis -mindepth 1 -phase 24 -libformat T -classifier KNN -reference B73_RefGen_v2.fa -cores 12 -maxhits 25   -libs sTR_dcl5_1_2.0.tag W23_2.0_2.tag sTP_dcl5_1_2.0.tag W23_2.0_1.tag
+```
+
 ## How Phasis writes files (important)
 
 Phasis uses **two locations**:
