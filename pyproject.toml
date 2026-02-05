@@ -7,7 +7,7 @@ name = "phasis"
 version = "2.5.3"
 description = "PHAS locus detection and scoring pipeline"
 authors = [{ name = "Atul Kakrana,Thales H Cherubino Ribeiro, Blake C. Meyers" }]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 
 dependencies = [
   "numpy",

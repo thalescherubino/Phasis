@@ -5,6 +5,7 @@ import argparse
 import os
 import sys
 from typing import List, Optional
+from .pipeline import run_pipeline
 
 from . import __version__
 from . import runtime as rt
@@ -187,15 +188,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     configure_runtime(args)
 
+    # MUST be before any multiprocessing pool creation
+    import phasis.runtime as rt
+    rt.save_snapshot()
+
     # IMPORTANT for macOS + multiprocessing + matplotlib:
-    # set this BEFORE importing legacy (which may import matplotlib).
+    # set this BEFORE importing anything that might import matplotlib.
     os.environ.setdefault("MPLBACKEND", "Agg")
 
-    # Import legacy only after runtime is configured and backend set.
+    # Prefer: run pipeline orchestration (which may call legacy under the hood)
     from . import legacy
-
-    # Mirror runtime config -> legacy globals (keeps existing legacy code working)
     sync_legacy_globals_from_runtime(legacy)
-
-    legacy.legacy_entrypoint()
-    return 0
+    return run_pipeline()

@@ -8,6 +8,7 @@ phasis/deps_check.py
 phasis/from.hive.phasis.py
 phasis/legacy.py
 phasis/parallel.py
+phasis/pipeline.py
 phasis/runtime.py
 phasis/utils.py
 phasis.egg-info/PKG-INFO

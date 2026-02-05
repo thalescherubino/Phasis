@@ -2,7 +2,6 @@
 
 version = 'v 2.5.3'
 
-## updated      :   2025/11/11
 ##                  Authors : Atul Kakrana,Thales H Cherubino Ribeiro, Blake C. Meyers
 ##                  Affilations  : Meyers Lab (Donald Danforth Plant Science Center, St. Louis, MO)
 ##                  License copy: Included and found at https://opensource.org/licenses/Artistic-2.0
@@ -145,6 +144,20 @@ def sync_from_runtime() -> None:
         rt.window_len = window_len
         rt.sliding = sliding
 
+    # ------------------------------------------------------------
+    # Spawn-safe: rebuild WIN_SCORE_LOOKUP in this process if missing.
+    # On macOS (spawn), workers don't inherit populated globals.
+    # We load from the scored TSV path saved in rt.clusters_scored_tsv.
+    # ------------------------------------------------------------
+    try:
+        if not globals().get("WIN_SCORE_LOOKUP"):
+            p = getattr(rt, "clusters_scored_tsv", None)
+            if p and os.path.isfile(p):
+                load_win_score_lookup_from_tsv(p)
+    except Exception:
+        pass
+
+
 
 def checkLibs():
     '''
@@ -180,13 +193,12 @@ def checkDependency():
     print("#### Fn: checkLibs ###########################")
     goSignal  = True ### Signal to process is set to true
     ### Check PYTHON version
-    pythonver = sys.version_info[0]
-    if int(pythonver) >= 3:
-        print("--Python v3.0 or higher          : found")
-        pass
+    major, minor = sys.version_info[:2]
+    if (major, minor) >= (3, 10):
+            print("--Python v3.10 or higher         : found")
     else:
-        print("--Python v3.0 or higher          : missing")
-        goSignal    = False
+        print("--Python v3.10 or higher         : missing")
+        goSignal = False
     ### Check hisat
     is_hisat = shutil.which("hisat2")
     if is_hisat:
@@ -769,7 +781,6 @@ def libraryprocess(libs):
       - Keep existing [LIBRARIES] behavior unchanged.
     """
     print("#### Fn: Lib Processor #######################")
-    from phasis.cache import compute_md5_str
     libs_to_process = []
     config = configparser.ConfigParser()
     config.optionxform = str
@@ -1592,7 +1603,6 @@ def clusterprocess(libs_poscountdict, clustfolder):
                 try:
                     os.replace(lfile, want_l)
                 except Exception:
-                    import shutil
                     shutil.copy2(lfile, want_l)
                     try:
                         os.remove(lfile)
@@ -1602,7 +1612,6 @@ def clusterprocess(libs_poscountdict, clustfolder):
                 try:
                     os.replace(sfile, want_s)
                 except Exception:
-                    import shutil
                     shutil.copy2(sfile, want_s)
                     try:
                         os.remove(sfile)
@@ -3737,8 +3746,6 @@ def ensure_mergedClusterDict_always(concat_libs: bool,
         end_col   = next((c for c in ("End","end","stop")               if c in mdf.columns), None)
         if not all([cid_col, chr_col, start_col, end_col]):
             raise ValueError(f"{merged_out_path} lacks required columns (have: {list(mdf.columns)})")
-
-        from collections import defaultdict
         mcd = defaultdict(list)
         for cid, achr, s, e in mdf[[cid_col, chr_col, start_col, end_col]].itertuples(index=False):
             try:
@@ -3897,17 +3904,12 @@ def build_and_save_phas_clusters(allClusters: pd.DataFrame) -> pd.DataFrame:
     """
     print("### Step: Build PHAS clusters per (chromosome, library) — parallel ###")
 
-    # ---- runtime-first knobs (fallback to legacy globals) ----
-    try:
-        import phasis.runtime as rt
-    except Exception:
-        rt = None
-
-    phase_local = (getattr(rt, "phase", None) if rt else None) or globals().get("phase")
-    memfile_local = (getattr(rt, "memFile", None) if rt else None) or globals().get("memFile")
-    concat_local = (getattr(rt, "concat_libs", None) if rt else None)
+    phase_local = getattr(rt, "phase", None) or globals().get("phase")
+    memfile_local = getattr(rt, "memFile", None) or globals().get("memFile")
+    concat_local = getattr(rt, "concat_libs", None)
     if concat_local is None:
         concat_local = globals().get("concat_libs", False)
+
 
     output_file = phase2_basename("PHAS_to_detect.tab")
 
@@ -4628,13 +4630,64 @@ def compute_scores_for_group(chromosome_data_group):
 
     return out
 
+def _record_clusters_scored_tsv_path(path: str) -> None:
+    """
+    Persist scored TSV path into runtime + snapshot (spawn-safe).
+
+    macOS spawn workers must rebuild WIN_SCORE_LOOKUP from the scored TSV.
+    This stores the absolute path in rt and updates the runtime snapshot file.
+    """
+    try:
+        if not path:
+            return
+        p = os.path.abspath(os.path.expanduser(path))
+        rt.clusters_scored_tsv = p
+
+        # Save back to the same snapshot file if already set, else create default
+        snap = getattr(rt, "runtime_snapshot", None)
+        if hasattr(rt, "save_snapshot"):
+            rt.save_snapshot(snap)
+    except Exception:
+        # Never fail legacy execution because of snapshot bookkeeping
+        return
+
+
+def infer_library_from_cluster_id(cid: str, phase_value: int) -> str:
+    """
+    Infer library from cluster_id (compact IDs), with fallbacks for old IDs.
+
+    Rules (same as your nested _infer_lib):
+      1) If '-' exists: library is everything before the last '-'
+      2) Else: split on '{phase}-PHAS' or '{swap_phase}-PHAS'
+      3) Else: UNKNOWN
+    """
+    s = str(cid)
+
+    if "-" in s:
+        return s.rsplit("-", 1)[0]
+
+    swap_phase = (21 if phase_value == 24 else 24 if phase_value == 21 else phase_value)
+    tag_main = f"{phase_value}-PHAS"
+    tag_alt = f"{swap_phase}-PHAS"
+
+    if tag_main in s:
+        return s.split(tag_main)[0]
+    if tag_alt in s:
+        return s.split(tag_alt)[0]
+
+    return "UNKNOWN"
+
 def compute_and_save_phasis_scores(clusters: pd.DataFrame) -> pd.DataFrame:
     """
     Compute PHASIS scores per (chromosome, library) group in parallel.
     Writes {phase}_clusters_scored.tsv and caches its hash in memFile.
+
+    Spawn-safety:
+      - Records rt.clusters_scored_tsv and saves runtime snapshot so that
+        macOS spawn workers can rebuild WIN_SCORE_LOOKUP from this TSV.
     """
     print("### Step: Compute PHASIS scores per (chromosome, library) ###")
-    outfname = phase2_basename('clusters_scored.tsv')
+    outfname = phase2_basename("clusters_scored.tsv")
 
     # --- Early hash check ---
     cfg = configparser.ConfigParser()
@@ -4653,67 +4706,81 @@ def compute_and_save_phasis_scores(clusters: pd.DataFrame) -> pd.DataFrame:
             for c in ("phasis_score", "combined_fishers"):
                 if c in df_cached.columns:
                     df_cached[c] = pd.to_numeric(df_cached[c], errors="coerce").fillna(0.0)
+
+            # >>> spawn fix: persist scored TSV path for workers
+            _record_clusters_scored_tsv_path(outfname)
             return df_cached
 
     # --- Guard input ---
     if clusters is None or getattr(clusters, "empty", True):
         print("[INFO] compute_and_save_phasis_scores: empty input; writing empty file.")
-        pd.DataFrame(columns=["cID", "phasis_score", "combined_fishers"]).to_csv(outfname, sep="\t", index=False)
+        pd.DataFrame(columns=["cID", "phasis_score", "combined_fishers"]).to_csv(
+            outfname, sep="\t", index=False
+        )
+
         if os.path.isfile(outfname):
-            _, out_md5 = getmd5(outfname); cfg[section][outfname] = out_md5
-            with open(memFile, 'w') as fh: cfg.write(fh)
+            _, out_md5 = getmd5(outfname)
+            cfg[section][outfname] = out_md5
+            with open(memFile, "w") as fh:
+                cfg.write(fh)
+
+        # >>> spawn fix: persist scored TSV path for workers (even if empty)
+        _record_clusters_scored_tsv_path(outfname)
         return pd.DataFrame(columns=["cID", "phasis_score", "combined_fishers"])
 
     # --- Derive chromosome & library from compact IDs (robust) ---
     clusters = clusters.copy()
-    if 'cluster_id' not in clusters.columns:
+    if "cluster_id" not in clusters.columns:
         raise KeyError("compute_and_save_phasis_scores: input must contain 'cluster_id' column")
 
-    clusters['cluster_id'] = clusters['cluster_id'].astype(str)
+    clusters["cluster_id"] = clusters["cluster_id"].astype(str)
 
     # Chromosome = last underscore chunk
-    clusters['chromosome'] = clusters['cluster_id'].str.rsplit('_', n=1).str[-1]
+    clusters["chromosome"] = clusters["cluster_id"].str.rsplit("_", n=1).str[-1]
 
-    # Library = everything before the last '-' (compact IDs), with fallbacks for old IDs
-    swap_phase = (21 if phase == 24 else 24 if phase == 21 else phase)
-    tag_main = f"{phase}-PHAS"
-    tag_alt  = f"{swap_phase}-PHAS"
-
-    def _infer_lib(cid: str) -> str:
-        s = str(cid)
-        if '-' in s:
-            return s.rsplit('-', 1)[0]
-        if tag_main in s:
-            return s.split(tag_main)[0]
-        if tag_alt in s:
-            return s.split(tag_alt)[0]
-        return "UNKNOWN"
-
-    clusters['library'] = clusters['cluster_id'].map(_infer_lib)
+    # Library inference (no nested function)
+    phase_value = int(phase) if phase is not None else 21
+    clusters["library"] = [
+        infer_library_from_cluster_id(cid, phase_value) for cid in clusters["cluster_id"].tolist()
+    ]
 
     # Debug visibility on inference
     total_rows = len(clusters)
-    unknown_libs = int((clusters['library'] == "UNKNOWN").sum())
+    unknown_libs = int((clusters["library"] == "UNKNOWN").sum())
     if unknown_libs:
-        ex = clusters.loc[clusters['library'] == "UNKNOWN", 'cluster_id'].head(5).tolist()
+        ex = clusters.loc[clusters["library"] == "UNKNOWN", "cluster_id"].head(5).tolist()
         print(f"[WARN] {unknown_libs}/{total_rows} cluster_ids have UNKNOWN library. Examples: {ex}")
 
     # Ensure numeric columns (they might be strings if read from TSV)
-    for c in ('window_n', 'fw_pval_corr', 'rv_pval_corr', 'combined_window_p_value'):
+    for c in ("window_n", "fw_pval_corr", "rv_pval_corr", "combined_window_p_value"):
         if c in clusters.columns:
-            clusters[c] = pd.to_numeric(clusters[c], errors='coerce')
+            clusters[c] = pd.to_numeric(clusters[c], errors="coerce")
 
     # Group and ship to workers (dropna=False to avoid dropping UNKNOWN)
     groups = [
-        ((chrom, lib), df[['cluster_id','window_n','fw_pval_corr','rv_pval_corr',
-                           'combined_window_p_value','chromosome','library']].values.tolist())
-        for (chrom, lib), df in clusters.groupby(['chromosome', 'library'], sort=False, dropna=False)
+        (
+            (chrom, lib),
+            df[
+                [
+                    "cluster_id",
+                    "window_n",
+                    "fw_pval_corr",
+                    "rv_pval_corr",
+                    "combined_window_p_value",
+                    "chromosome",
+                    "library",
+                ]
+            ].values.tolist(),
+        )
+        for (chrom, lib), df in clusters.groupby(["chromosome", "library"], sort=False, dropna=False)
     ]
     print(f"  - Found {len(groups)} (chromosome, library) groups")
 
     if not groups:
-        print(f"[ERR] No groups formed. Unique cluster_ids={clusters['cluster_id'].nunique()}, "
-              f"chromosomes={clusters['chromosome'].nunique()}, libraries={clusters['library'].nunique()}")
+        print(
+            f"[ERR] No groups formed. Unique cluster_ids={clusters['cluster_id'].nunique()}, "
+            f"chromosomes={clusters['chromosome'].nunique()}, libraries={clusters['library'].nunique()}"
+        )
 
     # --- Parallel compute ---
     results = run_parallel_with_progress(
@@ -4721,7 +4788,7 @@ def compute_and_save_phasis_scores(clusters: pd.DataFrame) -> pd.DataFrame:
         groups,
         desc="Scoring windows via Fisher's method",
         min_chunk=1,
-        unit="lib-chr"
+        unit="lib-chr",
     )
 
     # Flatten and write
@@ -4732,10 +4799,12 @@ def compute_and_save_phasis_scores(clusters: pd.DataFrame) -> pd.DataFrame:
     if os.path.isfile(outfname):
         _, out_md5 = getmd5(outfname)
         cfg[section][outfname] = out_md5
-        with open(memFile, 'w') as fh:
+        with open(memFile, "w") as fh:
             cfg.write(fh)
         print(f"  - Wrote {outfname} (md5: {out_md5})")
 
+    # >>> spawn fix: persist scored TSV path for workers
+    _record_clusters_scored_tsv_path(outfname)
     return win_phasis_score
 
 
@@ -4777,6 +4846,36 @@ def set_win_score_lookup(win_df: pd.DataFrame) -> dict:
     globals()["WIN_SCORE_LOOKUP"] = mapping
     return mapping
 
+def load_win_score_lookup_from_tsv(path: str) -> dict:
+    """Load window-derived PHAS scores into a process-local lookup dict.
+
+    This is required on macOS (spawn) where worker processes do NOT inherit
+    module globals from the parent process.
+
+    Returns: dict[cID] -> (phasis_score, combined_fishers)
+    """
+    mapping = {}
+    if not path:
+        globals()["WIN_SCORE_LOOKUP"] = mapping
+        return mapping
+
+    try:
+        df = pd.read_csv(path, sep="\t", usecols=["cID", "phasis_score", "combined_fishers"])
+    except Exception:
+        globals()["WIN_SCORE_LOOKUP"] = mapping
+        return mapping
+
+    for row in df.itertuples(index=False):
+        try:
+            cid = str(row.cID).strip()
+            ps = float(row.phasis_score)
+            cf = float(row.combined_fishers)
+            mapping[cid] = (ps, cf)
+        except Exception:
+            continue
+
+    globals()["WIN_SCORE_LOOKUP"] = mapping
+    return mapping
 
 def features_to_detection(clusters_data: pd.DataFrame) -> pd.DataFrame:
     """
@@ -5621,118 +5720,227 @@ def plot_phasAbundance_heat_map(phasis_result_df, type):
 def plot_totalAbundance_heat_map(phasis_result_df, type):
     print("#### Plotting PHAS and non-PHAS Heatmaps ######")
 
-    # Create DataFrames for PHAS and non-PHAS
-    #data_phas = pd.DataFrame(data=0.0, columns=list(phasis_result_df["alib"].unique()), index=list(phasis_result_df["identifier"].unique()))
-    data_phas = pd.DataFrame(
-    data=0.0, 
-    columns=sorted(list(phasis_result_df["alib"].unique())),  # Sort columns alphanumerically
-    index=list(phasis_result_df["identifier"].unique())
+    # ---- constants ----
+    eps = 1e-10  # small positive floor for log10
+
+    # ---- validate expected columns ----
+    needed = ("identifier", "alib", "label", "total_abund")
+    for col in needed:
+        if col not in phasis_result_df.columns:
+            raise KeyError(f"plot_totalAbundance_heat_map: missing required column: {col}")
+
+    # ---- coerce dtypes (robust to weird inputs) ----
+    df = phasis_result_df.copy()
+    df["identifier"] = df["identifier"].astype(str)
+    df["alib"] = df["alib"].astype(str)
+    df["label"] = df["label"].astype(str).fillna("")
+    df["total_abund"] = pd.to_numeric(df["total_abund"], errors="coerce")
+
+    # Sort columns alphanumerically (stable across runs/platforms)
+    all_cols = sorted([c for c in df["alib"].dropna().unique().tolist()])
+    all_rows = [r for r in df["identifier"].dropna().unique().tolist()]
+
+    # ---- define PHAS vs non-PHAS masks safely ----
+    # Keep legacy semantics:
+    # - "PHAS" is PHAS unless it is explicitly "non-PHAS"
+    is_non = df["label"].str.contains("non-PHAS", na=False)
+    is_phas = df["label"].str.contains("PHAS", na=False) & (~is_non)
+
+    # ---- build matrices via pivot (fast, no nested loops) ----
+    # If duplicates exist for (identifier, alib), take the max abundance deterministically.
+    phas_piv = (
+        df.loc[is_phas, ["identifier", "alib", "total_abund"]]
+          .pivot_table(index="identifier", columns="alib", values="total_abund", aggfunc="max")
     )
-    data_non_phas = data_phas.copy()
+    non_piv = (
+        df.loc[is_non, ["identifier", "alib", "total_abund"]]
+          .pivot_table(index="identifier", columns="alib", values="total_abund", aggfunc="max")
+    )
 
-    # Fill DataFrames with values from phasis_result_df for PHAS and non-PHAS
-    for i in tqdm(data_phas.index, desc="Processing Rows"):
-        tempRows = phasis_result_df[phasis_result_df["identifier"] == i]
-        
-        for j in data_phas.columns:
-            subSetData = tempRows[tempRows["alib"] == j]
-            if not subSetData.empty:
-                if "PHAS" in subSetData["label"].values and len(subSetData['total_abund']) > 0:
-                    data_phas.loc[i, j] = float(subSetData['total_abund'].iloc[0])
-                elif "non-PHAS" in subSetData["label"].values and len(subSetData['total_abund']) > 0:
-                    data_non_phas.loc[i, j] = float(subSetData['total_abund'].iloc[0])
+    # Ensure full shape with all identifiers/alibs, fill missing with 0.0
+    data_phas = phas_piv.reindex(index=all_rows, columns=all_cols).fillna(0.0)
+    data_non_phas = non_piv.reindex(index=all_rows, columns=all_cols).fillna(0.0)
 
-    # Apply log10 normalization
-    data_phas = np.log10(data_phas.replace(0, np.nan).fillna(1e-10))
-    data_non_phas = np.log10(data_non_phas.replace(0, np.nan).fillna(1e-10))
+    # ---- log10 transform safely ----
+    # Treat non-positive values as missing and replace with eps before log10
+    data_phas = data_phas.where(data_phas > 0, np.nan).fillna(eps)
+    data_non_phas = data_non_phas.where(data_non_phas > 0, np.nan).fillna(eps)
 
-    # Sort chromosomes numerically instead of lexicographically (i.e., 1, 2, 3, ... not 1, 10, 2, 3, ...)
-    chrom_data = [identifier.split(':')[0] for identifier in data_phas.index]
-    sorted_indices = sorted(range(len(chrom_data)), key=lambda idx: int(chrom_data[idx]) if chrom_data[idx].isdigit() else chrom_data[idx])
+    data_phas = np.log10(data_phas)
+    data_non_phas = np.log10(data_non_phas)
 
-    # Reorder DataFrames based on sorted chromosomes
+    # ---- sort rows by chromosome numeric order when possible ----
+    chrom_data = [identifier.split(":")[0] for identifier in data_phas.index]
+
+    sort_tuples = []
+    for idx, chrom in enumerate(chrom_data):
+        s = str(chrom)
+        low = s.lower()
+        # allow "chr1" as well as "1"
+        rest = s[3:] if low.startswith("chr") else s
+        if rest.isdigit():
+            key = (0, int(rest))
+        else:
+            key = (1, s)
+        sort_tuples.append((key, idx))
+
+    # tuple-sort without lambda
+    sort_tuples.sort()
+    sorted_indices = [idx for _, idx in sort_tuples]
+
     data_phas = data_phas.iloc[sorted_indices]
     data_non_phas = data_non_phas.iloc[sorted_indices]
 
-    # Re-extract the sorted chromosome data
     chrom_data = [chrom_data[idx] for idx in sorted_indices]
-    unique_chromosomes = sorted(np.unique(chrom_data), key=lambda x: int(x) if x.isdigit() else x)
 
-    # Max values for normalization
-    max_value_phas = data_phas.max().max()
-    max_value_non_phas = data_non_phas.max().max()
+    # unique chromosomes, sorted by same rule
+    uniq = list(np.unique(chrom_data))
+    uniq_sort = []
+    for chrom in uniq:
+        s = str(chrom)
+        low = s.lower()
+        rest = s[3:] if low.startswith("chr") else s
+        if rest.isdigit():
+            key = (0, int(rest))
+        else:
+            key = (1, s)
+        uniq_sort.append((key, s))
+    uniq_sort.sort()
+    unique_chromosomes = [s for _, s in uniq_sort]
 
+    # ---- robust normalization in log space (avoids vmin/vmax inversion) ----
+    phas_vals = data_phas.to_numpy(dtype=float)
+    non_vals = data_non_phas.to_numpy(dtype=float)
+
+    min_value_phas = float(np.nanmin(phas_vals))
+    max_value_phas = float(np.nanmax(phas_vals))
+    min_value_non = float(np.nanmin(non_vals))
+    max_value_non = float(np.nanmax(non_vals))
+
+    # guard against any weirdness
+    if not np.isfinite(min_value_phas) or not np.isfinite(max_value_phas):
+        min_value_phas, max_value_phas = 0.0, 0.0
+    if not np.isfinite(min_value_non) or not np.isfinite(max_value_non):
+        min_value_non, max_value_non = 0.0, 0.0
+
+    if max_value_phas < min_value_phas:
+        min_value_phas, max_value_phas = max_value_phas, min_value_phas
+    if max_value_non < min_value_non:
+        min_value_non, max_value_non = max_value_non, min_value_non
+
+    # avoid zero-width ranges (some mpl versions dislike it)
+    if max_value_phas == min_value_phas:
+        max_value_phas = min_value_phas + 1e-9
+    if max_value_non == min_value_non:
+        max_value_non = min_value_non + 1e-9
+
+    norm_phas = Normalize(vmin=min_value_phas, vmax=max_value_phas)
+    norm_non_phas = Normalize(vmin=min_value_non, vmax=max_value_non)
+
+    # ---- plotting ----
     f, ax = plt.subplots(figsize=(11, 11))
 
-    # Define custom colors for PHAS and non-PHAS
-    phas_colors = ["#D5E6D6", "#FF9999", "#FF0000"]  # Pastel red to red for PHAS
+    phas_colors = ["#D5E6D6", "#FF9999", "#FF0000"]  # pastel red to red
     non_phas_colors = ["#D5E6D6", "#9999FF", "#0000FF"]
-    # Normalize the colormap for PHAS and non-PHAS
-    norm_phas = Normalize(vmin=0, vmax=max_value_phas)
-    norm_non_phas = Normalize(vmin=0, vmax=max_value_non_phas)
 
-    # Plot PHAS heatmap first (non-transparent, priority layer)
-    cmap_phas = LinearSegmentedColormap.from_list('PHAS', phas_colors, N=256)
-    sns.heatmap(data_phas, square=False, cmap=cmap_phas, cbar=False, norm=norm_phas, xticklabels=True, yticklabels=False, ax=ax)
+    cmap_phas = LinearSegmentedColormap.from_list("PHAS", phas_colors, N=256)
+    cmap_non_phas = LinearSegmentedColormap.from_list("non-PHAS", non_phas_colors, N=256)
 
-    # Overlay non-PHAS heatmap with alpha blending (transparency)
-    cmap_non_phas = LinearSegmentedColormap.from_list('non-PHAS', non_phas_colors, N=256)
-    sns.heatmap(data_non_phas, square=False, cmap=cmap_non_phas, cbar=False, norm=norm_non_phas, xticklabels=True, yticklabels=False, ax=ax, alpha=0.5)
+    # PHAS base layer
+    sns.heatmap(
+        data_phas,
+        square=False,
+        cmap=cmap_phas,
+        cbar=False,
+        norm=norm_phas,
+        xticklabels=True,
+        yticklabels=False,
+        ax=ax,
+    )
 
-    # Create color bars for PHAS and non-PHAS
-    cax_phas = inset_axes(ax,
-                          width="5%",  # Set width for small size
-                          height="30%",  # Set height for vertical orientation
-                          loc='lower left',
-                          bbox_to_anchor=(-0.25, 0.6, 1, 1),  # Positioned closer
-                          bbox_transform=ax.transAxes,
-                          borderpad=0)
-    cbar_phas = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap_phas, norm=norm_phas), cax=cax_phas, orientation='vertical')
-    cbar_phas.set_ticks([0, max_value_phas/3, 2*max_value_phas/3, max_value_phas])
-    cbar_phas.set_ticklabels([f"{0:.1f}", f"{max_value_phas/3:.1f}", f"{2*max_value_phas/3:.1f}", f"{max_value_phas:.1f}"])
-    cbar_phas.set_label(r'log of $\it{PHAS}$ abundance', rotation=90, labelpad=15)
+    # non-PHAS overlay
+    sns.heatmap(
+        data_non_phas,
+        square=False,
+        cmap=cmap_non_phas,
+        cbar=False,
+        norm=norm_non_phas,
+        xticklabels=True,
+        yticklabels=False,
+        ax=ax,
+        alpha=0.5,
+    )
 
-    cax_non_phas = inset_axes(ax,
-                              width="5%",  # Set width for small size
-                              height="30%",  # Set height for vertical orientation
-                              loc='lower left',
-                              bbox_to_anchor=(-0.25, 0.0, 1, 1),  # Positioned below PHAS with vertical space
-                              bbox_transform=ax.transAxes,
-                              borderpad=0)
-    cbar_non_phas = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap_non_phas, norm=norm_non_phas), cax=cax_non_phas, orientation='vertical')
-    cbar_non_phas.set_ticks([0, max_value_non_phas/3, 2*max_value_non_phas/3, max_value_non_phas])
-    cbar_non_phas.set_ticklabels([f"{0:.1f}", f"{max_value_non_phas/3:.1f}", f"{2*max_value_non_phas/3:.1f}", f"{max_value_non_phas:.1f}"])
-    cbar_non_phas.set_label(r'log of non-$\it{PHAS}$ abundance', rotation=90, labelpad=10)
+    # ---- colorbars with correct (log-space) tick ranges ----
+    cax_phas = inset_axes(
+        ax,
+        width="5%",
+        height="30%",
+        loc="lower left",
+        bbox_to_anchor=(-0.25, 0.6, 1, 1),
+        bbox_transform=ax.transAxes,
+        borderpad=0,
+    )
+    cbar_phas = plt.colorbar(
+        plt.cm.ScalarMappable(cmap=cmap_phas, norm=norm_phas),
+        cax=cax_phas,
+        orientation="vertical",
+    )
+    ticks_phas = np.linspace(min_value_phas, max_value_phas, 4)
+    cbar_phas.set_ticks(ticks_phas)
+    cbar_phas.set_ticklabels([f"{t:.1f}" for t in ticks_phas])
+    cbar_phas.set_label(r"log of $\it{PHAS}$ abundance", rotation=90, labelpad=15)
 
-    # Add chromosome bar with shades of grey
-    cax2 = f.add_axes([0.17, 0.1, 0.02, 0.8])  # Adjust position for the left side
-    base_cmap = plt.get_cmap('Greys')
-    chrom_cmap = base_cmap(np.linspace(0.3, 0.9, len(unique_chromosomes)))  # Discretizing to avoid full black/white
+    cax_non = inset_axes(
+        ax,
+        width="5%",
+        height="30%",
+        loc="lower left",
+        bbox_to_anchor=(-0.25, 0.0, 1, 1),
+        bbox_transform=ax.transAxes,
+        borderpad=0,
+    )
+    cbar_non = plt.colorbar(
+        plt.cm.ScalarMappable(cmap=cmap_non_phas, norm=norm_non_phas),
+        cax=cax_non,
+        orientation="vertical",
+    )
+    ticks_non = np.linspace(min_value_non, max_value_non, 4)
+    cbar_non.set_ticks(ticks_non)
+    cbar_non.set_ticklabels([f"{t:.1f}" for t in ticks_non])
+    cbar_non.set_label(r"log of non-$\it{PHAS}$ abundance", rotation=90, labelpad=10)
+
+    # ---- chromosome sidebar ----
+    cax2 = f.add_axes([0.17, 0.1, 0.02, 0.8])
+    base_cmap = plt.get_cmap("Greys")
+    chrom_cmap = base_cmap(np.linspace(0.3, 0.9, len(unique_chromosomes)))
     chrom_color_map = {chrom: idx for idx, chrom in enumerate(unique_chromosomes)}
-    chrom_colors = np.array([chrom_color_map[chrom] for chrom in chrom_data]).reshape(-1, 1)
+    chrom_colors = np.array([chrom_color_map[str(ch)] for ch in chrom_data]).reshape(-1, 1)
 
-    # Plot the chromosome colorbar
-    cax2.imshow(chrom_colors, cmap=LinearSegmentedColormap.from_list('CustomGreys', chrom_cmap, len(unique_chromosomes)), aspect="auto")
-    cax2.set_xticks([])  # Remove x-axis ticks
-    cax2.set_yticks([])  # Remove y-axis ticks
+    cax2.imshow(
+        chrom_colors,
+        cmap=LinearSegmentedColormap.from_list("CustomGreys", chrom_cmap, len(unique_chromosomes)),
+        aspect="auto",
+    )
+    cax2.set_xticks([])
+    cax2.set_yticks([])
 
-    # Add chromosome numbers
-    chrom_positions = np.array([np.mean(np.where(np.array(chrom_data) == chrom)) for chrom in unique_chromosomes])
+    chrom_positions = np.array(
+        [np.mean(np.where(np.array(chrom_data) == chrom)) for chrom in unique_chromosomes]
+    )
     cax2.set_yticks(chrom_positions)
-    cax2.set_yticklabels(unique_chromosomes, fontsize=12, rotation=0, ha='center')
-    cax2.yaxis.set_tick_params(labelsize=16, pad=11)  # Adjust pad to move the labels to the left
+    cax2.set_yticklabels(unique_chromosomes, fontsize=12, rotation=0, ha="center")
+    cax2.yaxis.set_tick_params(labelsize=16, pad=11)
 
-    # Rotate column text 45 degrees
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=8)
-
-    # Adjust plot space for better visualization
+    # axis cosmetics
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
     plt.subplots_adjust(left=0.2, right=0.9, top=0.9, bottom=0.1)
 
-    # Save the plot
+    # ---- save ----
     fig = ax.get_figure()
-    def _p(d, name):  # path join w/o imports
-        return name if not d else (d + '/' + name if not d.endswith('/') else d + name)
-    fig.savefig(_p(outdir, f'{type}_{phase}_Abundance_PHAS_and_nonPHAS.pdf'), dpi=300)
+    fname = f"{type}_{phase}_Abundance_PHAS_and_nonPHAS.pdf"
+    outpath = fname if not outdir else os.path.join(outdir, fname)
+    fig.savefig(outpath, dpi=300)
     plt.close(fig)
 
     return None
@@ -5777,35 +5985,46 @@ def _parse_identifiers_and_alib(features: pd.DataFrame):
 def _plot_wrapper(job):
     """
     Worker-safe plot wrapper.
+
     Accepts:
-      - (fn, df, mname)                      [legacy format]
-      - (fn, df, mname, job_outdir, job_phase)  [spawn-safe format]
+      - (fn, df, mname)                              [legacy format]
+      - (fn, df, mname, job_outdir, job_phase)       [spawn-safe format]
+
+    Ensures `outdir` and `phase` globals are defined in the worker
+    without importing inside the function (macOS spawn-safe).
     """
-    # Unpack both formats
-    if len(job) == 3:
+    if not isinstance(job, (tuple, list)):
+        raise TypeError(f"_plot_wrapper expected tuple/list, got: {type(job)}")
+
+    n = len(job)
+    if n == 3:
         fn, df, mname = job
         job_outdir = None
         job_phase = None
-    elif len(job) == 5:
+    elif n == 5:
         fn, df, mname, job_outdir, job_phase = job
     else:
-        raise ValueError(f"Unexpected plot job tuple size: {len(job)}")
+        raise ValueError(f"Unexpected plot job tuple size: {n}")
 
     # Ensure globals exist in worker (spawn/fork safe)
     global outdir, phase
+
+    # Prefer explicit values passed in the job (most reliable across spawn)
     if job_outdir is not None:
         outdir = job_outdir
+    elif outdir is None:
+        # Fallback to runtime snapshot loaded in worker initializer
+        outdir = getattr(rt, "outdir", outdir)
+
     if job_phase is not None:
         phase = job_phase
+    elif phase is None:
+        phase = getattr(rt, "phase", phase)
 
-    # If still missing, pull from runtime as fallback
-    if outdir is None or phase is None:
+    # Ensure output directory exists (safe in parallel)
+    if outdir:
         try:
-            import phasis.runtime as rt
-            if outdir is None:
-                outdir = getattr(rt, "outdir", outdir)
-            if phase is None:
-                phase = getattr(rt, "phase", phase)
+            os.makedirs(outdir, exist_ok=True)
         except Exception:
             pass
 
