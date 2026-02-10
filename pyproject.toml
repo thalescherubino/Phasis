@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phasis"
+version = "2.5.3"
+description = "PHAS locus detection and scoring pipeline"
+authors = [{ name = "Atul Kakrana,Thales H Cherubino Ribeiro, Blake C. Meyers" }]
+requires-python = ">=3.10"
+
+dependencies = [
+  "numpy",
+  "pandas",
+  "scipy",
+  "scikit-learn",
+  "matplotlib",
+  "seaborn",
+  "joblib",
+  "tqdm",
+]
+
+[project.scripts]
+phasis = "phasis.cli:main"
+
+[tool.setuptools]
+packages = ["phasis", "phasis.stages"]
+
+[tool.setuptools.package-data]
+"phasis" = ["data/*.pkl"]
+
