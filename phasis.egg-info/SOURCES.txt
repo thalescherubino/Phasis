@@ -4,6 +4,7 @@ pyproject.toml
 phasis/__init__.py
 phasis/cache.py
 phasis/cli.py
+phasis/config.py
 phasis/deps_check.py
 phasis/from.hive.phasis.py
 phasis/ids.py
@@ -21,5 +22,8 @@ phasis.egg-info/requires.txt
 phasis.egg-info/top_level.txt
 phasis/data/knn_model.pkl
 phasis/stages/__init__.py
+phasis/stages/candidates_merge.py
+phasis/stages/classify.py
 phasis/stages/feature_assembly.py
+phasis/stages/output.py
 phasis/stages/window_scoring.py

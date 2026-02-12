@@ -55,6 +55,8 @@ from phasis.stages import feature_assembly as st_feature_assembly
 from phasis import ids as st_ids
 from phasis.stages import classify as st_classify
 from phasis.stages import output as st_output
+from .config import Phase2Config
+from phasis.stages import candidates_merge as st_cmerge
 
 memFile = MEM_FILE_DEFAULT
 
@@ -3497,12 +3499,14 @@ def _load_simple_tab_dict(path: str) -> dict:
 
 # --- ensure mergedClusterDict (ALWAYS builds universal IDs) ----------------
 
-def ensure_mergedClusterDict_always(concat_libs: bool,
-                                    phase: str,
-                                    merged_out_path: str,
-                                    loci_table_df: pd.DataFrame,
-                                    allClusters_df: pd.DataFrame,
-                                    memFile: str) -> dict:
+def ensure_mergedClusterDict_always(
+    concat_libs: bool,
+    phase: str,
+    merged_out_path: str,
+    loci_table_df,
+    allClusters_df,
+    memFile: str | None,
+):
     """
     Always return a dict universal_id -> [member clusterIDs] and ensure the tab exists.
     In concat mode we derive universal IDs (chr:start..end) from {phase}_merged_candidates.tab.
@@ -3575,73 +3579,6 @@ def ensure_mergedClusterDict_always(concat_libs: bool,
     globals()["mergedClusterDict"] = mcd
     _set_reverse_merged_map(mcd)
     return mcd
-
-def merge_candidate_clusters_across_libs(loci_table_path: str, out_path: str) -> pd.DataFrame:
-    """
-    Produce the per-(chromosome, library) merged candidates and write `out_path`.
-    On cache hit, LOAD + RETURN the cached file so callers always get a DataFrame.
-
-    In --concat_libs mode (single logical library), the merge is effectively a
-    pass-through of the loci table with alib="ALL_LIBS".
-    """
-    print("### Merging candidate clusters across libraries (per chromosome) ###")
-
-    config = configparser.ConfigParser()
-    config.optionxform = str
-    config.read(memFile)
-
-    section = "MERGED_CANDIDATES"
-    if not config.has_section(section):
-        config.add_section(section)
-
-    # --- Cache check
-    if os.path.isfile(out_path):
-        _, curr_md5 = getmd5(out_path)
-        prev_md5 = config[section].get(out_path)
-        if prev_md5 and prev_md5 == curr_md5:
-            print("Outputs up-to-date (hash match). Skipping merge computation.")
-            df_cached = pd.read_csv(out_path, sep="\t")
-
-            # Normalize required columns
-            if "chromosome" not in df_cached.columns and "chr" in df_cached.columns:
-                df_cached = df_cached.rename(columns={"chr": "chromosome"})
-            if "alib" not in df_cached.columns and concat_libs:
-                df_cached["alib"] = "ALL_LIBS"   # only in concat mode
-            # If not concat and 'alib' is missing, warn but still return (failsafe)
-            if "alib" not in df_cached.columns and not concat_libs:
-                print("[WARN] Cached merged table lacks 'alib' in non-concat mode.")
-            return df_cached
-
-    # --- Compute (for concat_libs this is a pass-through of the loci table)
-    if not os.path.isfile(loci_table_path):
-        print(f"[WARN] Loci table not found: {loci_table_path}. Returning empty DataFrame.")
-        return pd.DataFrame()
-
-    merged_df = pd.read_csv(loci_table_path, sep="\t")
-
-    # Normalize required columns
-    if "chromosome" not in merged_df.columns and "chr" in merged_df.columns:
-        merged_df = merged_df.rename(columns={"chr": "chromosome"})
-    if "alib" not in merged_df.columns:
-        # In concat mode, set the single logical library id
-        if concat_libs:
-            merged_df["alib"] = "ALL_LIBS"
-        else:
-            # Non-concat: don't guess; warn and provide a safe default.
-            # Downstream grouping will still work but may be degenerate; your aggregator should
-            # ideally have written 'alib' per row already for non-concat runs.
-            print("[WARN] 'alib' missing in loci table on non-concat run; setting 'alib'='UNKNOWN'.")
-            merged_df["alib"] = "UNKNOWN"
-
-    # Persist + hash
-    merged_df.to_csv(out_path, sep="\t", index=False)
-    _, new_md5 = getmd5(out_path)
-    config[section][out_path] = new_md5
-    with open(memFile, "w") as fh:
-        config.write(fh)
-    print(f"Hash for {os.path.basename(out_path)}:")
-
-    return merged_df
 
 def load_processed_clusters_fallback(phase: str) -> pd.DataFrame:
     """
@@ -4690,142 +4627,111 @@ def _plot_wrapper(job):
     return st_output._plot_wrapper(job)
 
 
-def _finalize_and_write_results(method_name: str, features: pd.DataFrame):
-    _sync_legacy_globals_from_runtime()
+def _finalize_and_write_results(
+    method_name: str,
+    features: pd.DataFrame,
+    *,
+    job_outdir: str | None = None,
+    job_phase: str | int | None = None,
+):
+    """
+    Finalize outputs via output stage without depending on legacy globals.
+
+    - If job_outdir/job_phase are not provided, fall back to rt.* (not legacy module globals).
+    """
+    if job_outdir is None:
+        job_outdir = getattr(rt, "outdir", None)
+
+    if job_phase is None:
+        job_phase = getattr(rt, "phase", None)
+
     return st_output.finalize_and_write_results(
         method_name,
         features,
-        job_outdir=outdir,
-        job_phase=phase,
+        job_outdir=job_outdir,
+        job_phase=job_phase,
     )
 
-def KNN_phas_clustering(features: pd.DataFrame):
+def KNN_phas_clustering(
+    features: pd.DataFrame,
+    *,
+    cfg: Phase2Config | None = None,
+    phasisScoreCutoff: float | None = None,
+    min_Howell_score: float | None = None,
+    max_complexity: float | None = None,
+    job_outdir: str | None = None,
+    job_phase: str | int | None = None,
+):
     """
     KNN classifier (legacy wrapper).
-    Behavior preserved: same labels + post-filters + same outputs/plots.
+    Behavior preserved; now supports explicit args/config.
     """
     print("### KNN classifier ###")
 
+    if cfg is not None:
+        phasisScoreCutoff = cfg.phasisScoreCutoff
+        min_Howell_score = cfg.min_Howell_score
+        max_complexity = cfg.max_complexity
+        job_outdir = cfg.outdir
+        job_phase = cfg.phase
+
+    if phasisScoreCutoff is None:
+        phasisScoreCutoff = globals()["phasisScoreCutoff"]
+    if min_Howell_score is None:
+        min_Howell_score = globals()["min_Howell_score"]
+    if max_complexity is None:
+        max_complexity = globals()["max_complexity"]
+
     labeled = st_classify.knn_classify(
         features,
-        phasisScoreCutoff=phasisScoreCutoff,
-        min_Howell_score=min_Howell_score,
-        max_complexity=max_complexity,
+        phasisScoreCutoff=float(phasisScoreCutoff),
+        min_Howell_score=float(min_Howell_score),
+        max_complexity=float(max_complexity),
     )
 
-    _finalize_and_write_results("KNN", labeled)
+    _finalize_and_write_results("KNN", labeled, job_outdir=job_outdir, job_phase=job_phase)
 
 
-def GMM_phas_clustering(features: pd.DataFrame, n_clusters: int = 2):
+def GMM_phas_clustering(
+    features: pd.DataFrame,
+    n_clusters: int = 2,
+    *,
+    cfg: Phase2Config | None = None,
+    phasisScoreCutoff: float | None = None,
+    min_Howell_score: float | None = None,
+    max_complexity: float | None = None,
+    job_outdir: str | None = None,
+    job_phase: str | int | None = None,
+):
     """
     GMM classifier (legacy wrapper).
-    Behavior preserved: same labels + post-filters + same outputs/plots.
+    Behavior preserved; now supports explicit args/config.
     """
     print("### GMM classifier ###")
 
+    if cfg is not None:
+        phasisScoreCutoff = cfg.phasisScoreCutoff
+        min_Howell_score = cfg.min_Howell_score
+        max_complexity = cfg.max_complexity
+        job_outdir = cfg.outdir
+        job_phase = cfg.phase
+
+    if phasisScoreCutoff is None:
+        phasisScoreCutoff = globals()["phasisScoreCutoff"]
+    if min_Howell_score is None:
+        min_Howell_score = globals()["min_Howell_score"]
+    if max_complexity is None:
+        max_complexity = globals()["max_complexity"]
+
     labeled = st_classify.gmm_classify(
         features,
-        phasisScoreCutoff=phasisScoreCutoff,
-        min_Howell_score=min_Howell_score,
-        max_complexity=max_complexity,
-        n_clusters=n_clusters,
+        phasisScoreCutoff=float(phasisScoreCutoff),
+        min_Howell_score=float(min_Howell_score),
+        max_complexity=float(max_complexity),
+        n_clusters=int(n_clusters),
     )
 
-    _finalize_and_write_results("GMM", labeled)
-
-def chromosome_clusters_to_candidate_loci(chromosome_df):
-    '''
-    For a single chromosome, convert clusters to candidate loci based on minimum length.
-    '''
-    lociTablelist = []
-    
-    # Group by clusterID and calculate min and max positions
-    cluster_positions = chromosome_df.groupby("clusterID")["pos"].agg(["min", "max"]).reset_index()
-
-    # Merge to get the chromosome for each clusterID
-    cluster_info = chromosome_df.merge(cluster_positions, on='clusterID')
-
-    # Clean up the clusterID to remove extra tabs or whitespace
-    cluster_info['clusterID'] = cluster_info['clusterID'].str.strip()
-
-    # Create a mask for clusters longer than minClusterLength
-    mask = (cluster_info['max'] - cluster_info['min']) >= minClusterLength
-
-    # Apply mask and create lociTablelist with relevant columns, using .values.tolist()
-    lociTablelist = cluster_info[mask].apply(lambda row: [
-        row['clusterID'].replace('\t', '').strip(),
-        0,
-        int(row['chromosome']),
-        int(row['min']),
-        int(row['max'])
-    ], axis=1).values.tolist()
-
-    return lociTablelist
-    
-def loci_table_from_clusters(allClusters):
-    print("### Building loci table from clusters per chromosome ###")
-    
-    outfname = phase2_basename('candidate.loci_table.tab')
-
-    # Step 0: Check if output is up-to-date (file exists and hash matches memory file)
-    config = configparser.ConfigParser()
-    config.optionxform = str
-    config.read(memFile)
-    section = 'LOCI_TABLE'
-    if not config.has_section(section):
-        config.add_section(section)
-
-    if os.path.isfile(outfname):
-        _, current_md5 = getmd5(outfname)
-        prev_md5 = config[section].get(outfname)
-        if prev_md5 and current_md5 == prev_md5:
-            print(f"File {outfname} is up-to-date (hash match). Skipping recomputation.")
-            print(f"Loci table written to {outfname}")
-            with open(outfname, 'r') as file:
-                lines = file.readlines()[1:]  # skip header
-                lociTablelist_unique = [line.strip().split('\t') for line in lines]
-            return pd.DataFrame(lociTablelist_unique, columns=["name","pval","chr","start","end"])
-
-    # Step 1: Split data into chromosome groups
-    chromosome_groups = [df for _, df in allClusters.groupby("chromosome")]
-    
-    # Step 2: Multicore processing (unit 'lib-chr')
-    lociTablelist = run_parallel_with_progress(
-        chromosome_clusters_to_candidate_loci,
-        chromosome_groups,
-        desc="LociTable chromosomes",
-        min_chunk=1,
-        unit="lib-chr"
-    )
-
-    # Step 3: Flatten the results
-    lociTablelist = [item for sublist in lociTablelist for item in sublist]
-
-    # Step 4: Remove duplicates
-    seen = set()
-    lociTablelist_unique = []
-    for item in lociTablelist:
-        row_tuple = tuple(item)
-        if row_tuple not in seen:
-            seen.add(row_tuple)
-            lociTablelist_unique.append(item)
-
-    # Step 5: Write results to file
-    with open(outfname, 'w') as file:
-        file.write("Cluster\tvalue1\tchromosome\tStart\tEnd\n")
-        for row in lociTablelist_unique:
-            file.write('\t'.join(map(str, row)) + '\n')
-
-    # Step 6: Update memory file with output hash
-    if os.path.isfile(outfname):
-        _, out_md5 = getmd5(outfname)
-        config[section][outfname] = out_md5
-        print(f"Hash for {outfname}: {out_md5}")
-    with open(memFile, 'w') as fh:
-        config.write(fh)
-
-    print(f"Loci table written to {outfname}")
-    return pd.DataFrame(lociTablelist_unique, columns=["name","pval","chr","start","end"])
+    _finalize_and_write_results("GMM", labeled, job_outdir=job_outdir, job_phase=job_phase)
 
 def compute_scores_for_group(chromosome_data_group):
     return ws.compute_scores_for_group(chromosome_data_group)
@@ -4854,8 +4760,161 @@ def process_chromosome_features(chromosome_df):
     return st_feature_assembly.process_chromosome_features(chromosome_df)
 
 
-def features_to_detection(clusters_data):
-    return st_feature_assembly.features_to_detection(clusters_data)
+def features_to_detection(
+    clusters_data,
+    *,
+    phase=None,
+    outdir=None,
+    concat_libs=None,
+    memFile=None,
+    outfname=None,
+):
+    return st_feature_assembly.features_to_detection(
+        clusters_data,
+        phase=phase,
+        outdir=outdir,
+        concat_libs=concat_libs,
+        memFile=memFile,
+        outfname=outfname,
+    )
+
+def chromosome_clusters_to_candidate_loci(chromosome_df, **kwargs):
+    """Legacy compatibility wrapper → stage implementation."""
+    return st_cmerge.chromosome_clusters_to_candidate_loci(chromosome_df, **kwargs)
+
+
+def loci_table_from_clusters(allClusters, **kwargs):
+    """Legacy compatibility wrapper → stage implementation."""
+    return st_cmerge.loci_table_from_clusters(allClusters, **kwargs)
+
+
+def merge_candidate_clusters_across_libs(loci_table_path: str, out_path: str, **kwargs):
+    """Legacy compatibility wrapper → stage implementation."""
+    return st_cmerge.merge_candidate_clusters_across_libs(loci_table_path, out_path, **kwargs)
+
+
+def run_phase1(libs):
+    """
+    Phase I (cfind): preprocess → map → parse → cluster → window scoring.
+    Returns clusterFilePaths (same object legacy.main previously used).
+    """
+    clusterFilePaths = None
+
+    print("######            Starting Phase I           #########")
+    runLog = 'runtime_%s' % datetime.datetime.now().strftime("%m_%d_%H_%M")
+    fh_run = open(runLog, 'w')
+    try:
+        # Create folders, build/reuse index
+        clustfolder = createfolders(os.getcwd())
+        genoIndex   = getindex(fh_run)
+
+        # Preprocess → map → parse
+        libs_processed                    = libraryprocess(libs)
+        libs_mapped                       = mapprocess(libs_processed, genoIndex)
+        libs_nestdict, libs_poscountdict  = parserprocess(libs_processed)
+
+        # Find clusters
+        libs_clustdicts = clusterprocess(libs_poscountdict, clustfolder)
+
+        # Score (bucketed hashing will skip when cached)
+        clusterFilePaths = scoringprocess(
+            libs_processed, libs_clustdicts, libs_nestdict, clustfolder
+        )
+    finally:
+        try: fh_run.close()
+        except Exception: pass
+
+    return clusterFilePaths
+
+
+def run_phase2(clusterFilePaths, cfg: Phase2Config | None = None):
+    """
+    Phase II (class): merge candidates, ensure universal IDs, build clusters,
+    select windows, score, feature assembly, classify, and write outputs/plots.
+    """
+
+    print("######            Starting Phase II          #########")
+    if cfg is None:
+        cfg = Phase2Config.from_runtime()
+    # If running 'class' only, take precomputed cluster files
+    if cfg.steps == 'class':
+        clusterFilePaths = cfg.class_cluster_file
+
+
+    # 1) Aggregate for side-effects (writes processed clusters)
+    agg_df = aggregate_and_write_processed_clusters(clusterFilePaths)
+
+    # Build "allClusters" baseline from aggregator result or file fallback
+    if agg_df is not None:
+        allClusters = agg_df
+    else:
+        proc_path = phase2_basename('processed_clusters.tab')
+        allClusters = (
+            pd.read_csv(proc_path, sep="\t") if os.path.isfile(proc_path) else pd.DataFrame()
+        )
+
+    # Normalize for downstream grouping
+    allClusters = _normalize_cluster_df(allClusters, is_concat=cfg.concat_libs)
+
+    # 2) ALWAYS emit loci table BEFORE merge (guarantees the input exists for merge)
+    loci_table_df   = loci_table_from_clusters(allClusters)  # writes {phase}_candidate.loci_table.tab
+    loci_table_path = phase2_basename('candidate.loci_table.tab')
+
+    # 3) Build the DataFrame used downstream
+    merged_out_path = phase2_basename('merged_candidates.tab')
+    if cfg.concat_libs:
+        # Cache-aware merge: returns a DataFrame (loads TSV on cache hit)
+        allClustersMerged = merge_candidate_clusters_across_libs(
+            loci_table_path, merged_out_path
+        )
+    else:
+        # Non-concat: analysis continues with the pre-merge representation
+        # (cross-lib overlap merging for universal IDs is handled right below)
+        allClustersMerged = allClusters
+
+    # 3.5) Always ensure universal-ID dict (used by getUniversalID)
+    #      In concat mode: load/write identity dict from merged TSV if needed.
+    #      In non-concat: perform cross-lib merging via parametric path.
+    mcd = ensure_mergedClusterDict_always(
+        concat_libs=concat_libs,
+        phase=phase,
+        merged_out_path=merged_out_path,
+        loci_table_df=loci_table_df,
+        allClusters_df=allClusters,
+        memFile=memFile
+    )
+    globals()['mergedClusterDict'] = mcd
+    print(f"[INFO] mergedClusterDict ready with {len(mcd)} universal IDs.")
+
+    # 4) Build PHAS clusters (handles empty input)
+    clusters_data = build_and_save_phas_clusters(allClusters)
+
+    # 5) If there are no clusters, short-circuit cleanly
+    if clusters_data is None or getattr(clusters_data, "empty", True):
+        print("[INFO] No PHAS clusters to score; exiting classification early.")
+
+    # 6) Select windows (cache-aware and robust)
+    clusters = select_scoring_windows(clusters_data)
+    if clusters is None or getattr(clusters, "empty", True):
+        print("[INFO] No scoring windows found; exiting classification early.")
+
+    # 7) Score windows, expose compact lookup to workers, extract features, classify
+    win_phasis_score = compute_and_save_phasis_scores(clusters)
+
+    # Make the compact, read-only lookup visible to workers (for process_chromosome_features)
+    set_win_score_lookup(win_phasis_score)
+
+    features = features_to_detection(
+        clusters_data,
+        phase=cfg.phase,
+        outdir=cfg.outdir,
+        concat_libs=cfg.concat_libs,
+        memFile=cfg.memFile,
+    )
+    if cfg.classifier == "GMM":
+        GMM_phas_clustering(features, cfg=cfg)
+    elif cfg.classifier == "KNN":
+        KNN_phas_clustering(features, cfg=cfg)
 
 def main(libs):
     """
@@ -4879,110 +4938,15 @@ def main(libs):
 
     # -------------------------- PART I: cfind --------------------------
     if (steps == 'both') or (steps == 'cfind'):
-        print("######            Starting Phase I           #########")
-        runLog = 'runtime_%s' % datetime.datetime.now().strftime("%m_%d_%H_%M")
-        fh_run = open(runLog, 'w')
-        try:
-            # Create folders, build/reuse index
-            clustfolder = createfolders(os.getcwd())
-            genoIndex   = getindex(fh_run)
-
-            # Preprocess → map → parse
-            libs_processed                    = libraryprocess(libs)
-            libs_mapped                       = mapprocess(libs_processed, genoIndex)
-            libs_nestdict, libs_poscountdict  = parserprocess(libs_processed)
-
-            # Find clusters
-            libs_clustdicts = clusterprocess(libs_poscountdict, clustfolder)
-
-            # Score (bucketed hashing will skip when cached)
-            clusterFilePaths = scoringprocess(
-                libs_processed, libs_clustdicts, libs_nestdict, clustfolder
-            )
-        finally:
-            try: fh_run.close()
-            except Exception: pass
+        clusterFilePaths = run_phase1(libs)
 
     # -------------------------- PART II: class -------------------------
     if (steps == 'both') or (steps == 'class'):
-        print("######            Starting Phase II          #########")
+        run_phase2(clusterFilePaths)
 
-        # If running 'class' only, take precomputed cluster files
-        if steps == 'class':
-            clusterFilePaths = class_cluster_file
+    return None
 
-        # 1) Aggregate for side-effects (writes processed clusters)
-        agg_df = aggregate_and_write_processed_clusters(clusterFilePaths)
 
-        # Build "allClusters" baseline from aggregator result or file fallback
-        if agg_df is not None:
-            allClusters = agg_df
-        else:
-            proc_path = phase2_basename('processed_clusters.tab')
-            allClusters = (
-                pd.read_csv(proc_path, sep="\t") if os.path.isfile(proc_path) else pd.DataFrame()
-            )
-
-        # Normalize for downstream grouping
-        allClusters = _normalize_cluster_df(allClusters, is_concat=concat_libs)
-
-        # 2) ALWAYS emit loci table BEFORE merge (guarantees the input exists for merge)
-        loci_table_df   = loci_table_from_clusters(allClusters)  # writes {phase}_candidate.loci_table.tab
-        loci_table_path = phase2_basename('candidate.loci_table.tab')
-
-        # 3) Build the DataFrame used downstream
-        merged_out_path = phase2_basename('merged_candidates.tab')
-        if concat_libs:
-            # Cache-aware merge: returns a DataFrame (loads TSV on cache hit)
-            allClustersMerged = merge_candidate_clusters_across_libs(
-                loci_table_path, merged_out_path
-            )
-        else:
-            # Non-concat: analysis continues with the pre-merge representation
-            # (cross-lib overlap merging for universal IDs is handled right below)
-            allClustersMerged = allClusters
-
-        # 3.5) Always ensure universal-ID dict (used by getUniversalID)
-        #      In concat mode: load/write identity dict from merged TSV if needed.
-        #      In non-concat: perform cross-lib merging via parametric path.
-        mcd = ensure_mergedClusterDict_always(
-            concat_libs=concat_libs,
-            phase=phase,
-            merged_out_path=merged_out_path,
-            loci_table_df=loci_table_df,
-            allClusters_df=allClusters,
-            memFile=memFile
-        )
-        globals()['mergedClusterDict'] = mcd
-        print(f"[INFO] mergedClusterDict ready with {len(mcd)} universal IDs.")
-
-        # 4) Build PHAS clusters (handles empty input)
-        clusters_data = build_and_save_phas_clusters(allClusters)
-
-        # 5) If there are no clusters, short-circuit cleanly
-        if clusters_data is None or getattr(clusters_data, "empty", True):
-            print("[INFO] No PHAS clusters to score; exiting classification early.")
-
-        # 6) Select windows (cache-aware and robust)
-        clusters = select_scoring_windows(clusters_data)
-        if clusters is None or getattr(clusters, "empty", True):
-            print("[INFO] No scoring windows found; exiting classification early.")
-
-        # 7) Score windows, expose compact lookup to workers, extract features, classify
-        win_phasis_score = compute_and_save_phasis_scores(clusters)
-
-        # Make the compact, read-only lookup visible to workers (for process_chromosome_features)
-        set_win_score_lookup(win_phasis_score)
-
-        features = features_to_detection(clusters_data)
-        if classifier == "GMM":
-            GMM_phas_clustering(features)
-        elif classifier == "KNN":
-            KNN_phas_clustering(features)
-
-        if getattr(rt, "cleanup", False):
-            cleanup()
-        return None
 
 def legacy_entrypoint():
     global ncores, libs

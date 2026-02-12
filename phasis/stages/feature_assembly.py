@@ -91,8 +91,7 @@ def ensure_win_score_lookup_ready() -> None:
         # keep feature assembly robust; caller will fall back to defaults
         return
 
-
-def features_to_detection(clusters_data: pd.DataFrame) -> pd.DataFrame:
+def features_to_detection(clusters_data: pd.DataFrame,*,phase: str | int | None = None,outdir: str | None = None,concat_libs: bool | None = None,memFile: str | None = None,outfname: str | None = None,) -> pd.DataFrame:
     """
     Assemble per-cluster feature set (parallel), write TSV, and memoize via md5.
     Uses legacy column names compatible with downstream KNN.
@@ -100,8 +99,29 @@ def features_to_detection(clusters_data: pd.DataFrame) -> pd.DataFrame:
     """
     print("### Step: assemble per-cluster features ###")
 
-    outfname = phase2_basename('cluster_set_features.tsv')
-    memFile = _get_memfile()
+    # Resolve defaults from runtime unless explicitly provided
+    if phase is None:
+        phase = getattr(rt, "phase", None)
+    if outdir is None:
+        outdir = getattr(rt, "outdir", None)
+    if concat_libs is None:
+        try:
+            concat_libs = bool(getattr(rt, "concat_libs", False))
+        except Exception:
+            concat_libs = False
+
+    if memFile is None:
+        memFile = _get_memfile()
+    else:
+        # Keep runtime consistent so other cache helpers still behave
+        rt.memFile = memFile
+        if outdir is not None:
+            rt.outdir = outdir
+
+    if outfname is None:
+        prefix = "concat_" if concat_libs else ""
+        outfname = f"{prefix}{phase}_cluster_set_features.tsv"
+
 
     # ---------- Early hash check ----------
     cfg = configparser.ConfigParser()
