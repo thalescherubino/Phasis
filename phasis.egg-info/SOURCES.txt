@@ -24,6 +24,8 @@ phasis/data/knn_model.pkl
 phasis/stages/__init__.py
 phasis/stages/candidates_merge.py
 phasis/stages/classify.py
+phasis/stages/cluster_aggregation.py
 phasis/stages/feature_assembly.py
 phasis/stages/output.py
+phasis/stages/phas_clusters.py
 phasis/stages/window_scoring.py

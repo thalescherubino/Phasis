@@ -57,6 +57,11 @@ from phasis.stages import classify as st_classify
 from phasis.stages import output as st_output
 from .config import Phase2Config
 from phasis.stages import candidates_merge as st_cmerge
+from phasis.stages import cluster_aggregation as st_cluster_aggregation
+from phasis.stages import phas_clusters as st_phas_clusters
+from phasis.stages import window_selection as st_winsel
+from phasis.stages.phase2_pipeline import run_phase2_pipeline
+
 
 memFile = MEM_FILE_DEFAULT
 
@@ -1530,10 +1535,6 @@ def process_cluster_batch(batch, batch_id):
             print(f"[ERROR] Fallback failed for batch {batch_id}: {ee}")
             return []
 
-def _safe_key(akey: str) -> str:
-    """Normalize an akey to a filesystem-safe basename."""
-    return os.path.basename(str(akey))
-
 def _prune_old_clustered_entries(cfg: configparser.ConfigParser, basename: str, keep_abs: str) -> int:
     """
     Remove stale [CLUSTERED] entries that have the same basename but point
@@ -2834,165 +2835,15 @@ def PPResults(module,alist):
     npool.close()
     return results
 
-#part II, cluster proccess
+#part II, cluster process
 
 def process_single_lib_cluster(filename):
-
-    clustlist = []
-
-    # library name from file basename: AR_1_nocontam.21-PHAS.candidate.clusters -> AR_1_nocontam
-    base = os.path.basename(filename)
-    alib = re.sub(r'\.\d+-PHAS\.candidate\.clusters$', '', base)
-
-    with open(filename) as fh:
-        lines = fh.readlines()
-
-    aid = None
-    for line in lines:
-        if line.startswith('>'):
-            # header like: ">cluster = lobe_3_nocontam-1_3894_1"
-            m = re.search(r'cluster\s*=\s*([^\s]+)', line)
-            if not m:
-                aid = None
-                continue
-            aid = m.group(1).strip()              # e.g. lobe_3_nocontam-1_3894_1
-            continue
-
-        # data lines belong to the most recent header (aid)
-        if not aid:
-            continue
-
-        ent = line.rstrip('\n').split('\t')
-        achr            = str(ent[0])
-        astrand         = str(ent[1])
-        apos            = int(ent[2])
-        alen            = int(ent[3])
-        ahits           = int(ent[4])
-        abun            = int(ent[5])
-        pval_h_f        = float(ent[6])
-        N_f             = int(ent[7])
-        X_f             = int(ent[8])
-        pval_r_f        = float(ent[9])
-        pval_corr_f     = float(ent[10])
-        pval_h_r        = float(ent[11])
-        N_r             = int(ent[12])
-        X_r             = int(ent[13])
-        pval_r_r        = float(ent[14])
-        pval_corr_r     = float(ent[15])
-        tag_id          = str(ent[16])
-        tag_seq         = str(ent[17])
-
-        # clusterID is the clean per-lib id (no filename glue)
-        clustlist.append((
-            alib, aid, achr, astrand, apos, alen, ahits, abun,
-            pval_h_f, N_f, X_f, pval_r_f, pval_corr_f, pval_h_r, N_r, X_r,
-            pval_r_r, pval_corr_r, tag_id, tag_seq
-        ))
-
-    return clustlist
-
-
-def aggregate_and_write_processed_clusters(clusterFiles):
-    print("### Aggregating and processing candidate cluster files per library ###")
-
-    # --- Parallel processing ---
-    # Use run_parallel_with_progress for multicore support (you must have it in your module!)
-    all_clustlists = run_parallel_with_progress(
-        process_single_lib_cluster,
+    return st_cluster_aggregation.process_single_lib_cluster(filename)
+def aggregate_and_write_processed_clusters(clusterFiles, memFile_override=None):
+    return st_cluster_aggregation.aggregate_and_write_processed_clusters(
         clusterFiles,
-        desc="Aggregating cluster files",
-        min_chunk=1,
-        unit="lib"
+        memFile=memFile_override,
     )
-    # Flatten list of lists
-    flat_clustlist = [item for sublist in all_clustlists for item in sublist]
-    allClusters = pd.DataFrame(flat_clustlist, columns=[
-        "alib", "clusterID", "chromosome", "strand", "pos", "len", "hits", "abun",
-        "pval_h_f", "N_f", "X_f", "pval_r_f", "pval_corr_f", "pval_h_r", "N_r", "X_r",
-        "pval_r_r", "pval_corr_r", "tag_id", "tag_seq"
-    ])
-    allClusters = allClusters.sort_values(by=["clusterID", "pos"])
-
-    outfname = phase2_basename('processed_clusters.tab')
-    allClusters.to_csv(outfname, sep="\t", index=False, header=True)
-
-    # --- Update hash in memory file ---
-    config = configparser.ConfigParser()
-    config.optionxform = str
-    config.read(memFile)
-    section = 'PROCESSED'
-    if not config.has_section(section):
-        config.add_section(section)
-    if os.path.isfile(outfname):
-        _, out_md5 = getmd5(outfname)
-        config[section][outfname] = out_md5
-        print(f"Hash for {outfname}: {out_md5}")
-    with open(memFile, 'w') as fh:
-        config.write(fh)
-
-    print(f"Processed clusters written to {outfname}")
-    return allClusters
-
-# ---- Grouping for parallel ----
-def group_loci_by_chromosome_for_parallel(loci_by_chr):
-    """Convert pandas groupby('chr') object into list-of-lists per chromosome."""
-    return [group.values.tolist() for _, group in loci_by_chr]
-
-# ---- Step 1: build pairs of overlapping loci per chromosome ----
-def merge_loci_pairs_by_chromosome(loci_group):
-    """
-    loci_group: list of [name, pval, chr, start, end] (all same chr).
-    Returns list of [A,B] pairs; adds [X,'singleLibOccurrence'] only for IDs
-    that never paired with anyone.
-    """
-    # 1) normalize to compact records: [name, start, end]
-    L = []
-    for name, pval, chr_, start, end in loci_group:
-        L.append([str(name).strip(), int(start), int(end)])
-
-    n = len(L)
-    if n <= 1:
-        return [[L[0][0], 'singleLibOccurrence']] if n == 1 else []
-
-    # 2) O(n) monotonicity check on (start, end)
-    maybe_sorted = True
-    ps, pe = L[0][1], L[0][2]
-    for i in range(1, n):
-        cs, ce = L[i][1], L[i][2]
-        if cs < ps or (cs == ps and ce < pe):
-            maybe_sorted = False
-            break
-        ps, pe = cs, ce
-
-    # 3) Only sort if needed (by start, then end)
-    if not maybe_sorted:
-        L.sort(key=lambda r: (r[1], r[2]))
-
-    # 4) pair generation with early break and true-singleton tracking
-    pairs = []
-    paired_ids = set()
-    all_ids = {r[0] for r in L}  # set avoids duplicates
-
-    for i in range(n):
-        aname, astart, aend = L[i]
-        for j in range(i + 1, n):
-            bname, bstart, bend = L[j]
-
-            # since L is sorted by start, once bstart is beyond a’s buffered end we can stop
-            if bstart > aend + clustbuffer:
-                break
-
-            # buffered overlap test
-            if (bend >= astart - clustbuffer) and (bstart <= aend + clustbuffer):
-                pairs.append([aname, bname])
-                paired_ids.add(aname)
-                paired_ids.add(bname)
-
-    # 5) emit singletons that never appeared in any pair
-    for name in all_ids - paired_ids:
-        pairs.append([name, 'singleLibOccurrence'])
-
-    return pairs
 
 # ---- Single-library preprocessing ----
 def preprocess_single_library_clusters(mergedClusters):
@@ -3348,97 +3199,11 @@ def assemble_candidate_clusters_parametric(
 
     return mergedClusterDict
 
-def merge_candidate_clusters_parametric(loci_df: pd.DataFrame,
-                                        allClusters_df: pd.DataFrame,
-                                        phase: str,
-                                        memFile: str):
-    """
-    Cross-library merge based on loci overlap, independent of concat mode.
-    - loci_df columns: ['name','pval','chr','start','end'] (strings OK)
-    - allClusters_df: DataFrame used to decide number of libraries (allClusters_df['alib'])
-    Writes:
-      {phase}_merged_clusters.tab
-      {phase}_mergedClusterDict.tab
-    Returns:
-      mergedClusterDict (dict: universal_id -> [member clusterIDs])
-    """
-    print("### Merging candidate clusters across libraries (per chromosome) ###")
-    # normalize loci_df columns just in case
-    loci_df = loci_df.rename(columns={"Cluster":"name","value1":"pval","chromosome":"chr","Start":"start","End":"end"})
+def merge_candidate_clusters_parametric(loci_df, allClusters_df, phase, memFile, **kwargs):
+    return st_ids.merge_candidate_clusters_parametric(
+        loci_df, allClusters_df, phase, memFile, **kwargs
+    )
 
-    merged_pairs_path = phase2_basename('merged_clusters.tab')
-    merged_dict_path  = phase2_basename('mergedClusterDict.tab')
-
-    # Hash-aware skip
-    cfg = configparser.ConfigParser(); cfg.optionxform = str
-    cfg.read(memFile)
-    if not cfg.has_section('MERGED_CLUSTERS'): cfg.add_section('MERGED_CLUSTERS')
-    if not cfg.has_section('MERGED_DICT'):     cfg.add_section('MERGED_DICT')
-
-    if os.path.isfile(merged_pairs_path) and os.path.isfile(merged_dict_path):
-        _, h_pairs = getmd5(merged_pairs_path)
-        _, h_dict  = getmd5(merged_dict_path)
-        if mem_get(cfg, 'MERGED_CLUSTERS', merged_pairs_path) == h_pairs and \
-           mem_get(cfg, 'MERGED_DICT', merged_dict_path)     == h_dict:
-            print("Outputs up-to-date (hash match). Skipping merge computation.")
-            if '_load_mergedClusterDict_from_tab' in globals():
-                return _load_mergedClusterDict_from_tab(merged_dict_path)
-            # minimal loader fallback
-            out = {}
-            with open(merged_dict_path, 'r') as fh:
-                for line in fh:
-                    parts = line.rstrip('\n').split('\t')
-                    if not parts: continue
-                    key = parts[0].strip()
-                    vals = [v for v in (p.strip() for p in parts[1:]) if v]
-                    out[key] = vals if vals else [key]
-            return out
-
-    # ---- build overlap pairs per chromosome (parallel if multi-lib) ----
-    mergedClusters = []
-    try:
-        nlibs = int(allClusters_df['alib'].nunique())
-    except Exception:
-        nlibs = 1
-
-    loci_df_sorted = loci_df.sort_values(['chr','start','end'], ascending=True)
-    if nlibs >= 2:
-        groups_as_lists = group_loci_by_chromosome_for_parallel(loci_df_sorted.groupby('chr'))
-        results = run_parallel_with_progress(
-            merge_loci_pairs_by_chromosome,
-            groups_as_lists,
-            desc="Find overlapping loci across libs",
-            min_chunk=1,
-            unit="lib-chr"
-        )
-        mergedClusters = [pair for sub in results for pair in sub]
-    else:
-        # single-library pass-through (identity)
-        for aname, apval, achr, astart, aend in loci_df_sorted[['name','pval','chr','start','end']].itertuples(index=False):
-            mergedClusters.append([aname, aname])
-
-    # write pairs (tab)
-    with open(merged_pairs_path, 'w') as fh:
-        for pair in mergedClusters:
-            fh.write('\t'.join(map(str, [e for e in pair if str(e).strip()])) + '\n')
-
-    # assemble dictionary and assign final IDs
-    mcd = assemble_candidate_clusters_parametric(mergedClusters, allClusters_df, phase)
-
-    # write dict (key \t values…)
-    with open(merged_dict_path, 'w', newline='') as fh:
-        wr = csv.writer(fh, delimiter='\t')
-        for key, values in mcd.items():
-            wr.writerow([key] + values)
-
-    # update hashes
-    if os.path.isfile(merged_pairs_path):
-        _, hp = getmd5(merged_pairs_path); mem_set(cfg, 'MERGED_CLUSTERS', merged_pairs_path, hp)
-    if os.path.isfile(merged_dict_path):
-        _, hd = getmd5(merged_dict_path);  mem_set(cfg, 'MERGED_DICT', merged_dict_path, hd)
-    with open(memFile, 'w') as fh: cfg.write(fh)
-
-    return mcd
 
 _MERGED_DICT_LOCK = threading.Lock()
 _MERGED_REVERSE_BUILT = False
@@ -3496,89 +3261,15 @@ def _load_simple_tab_dict(path: str) -> dict:
             out[key] = vals if vals else [key]
     return out
 
-
-# --- ensure mergedClusterDict (ALWAYS builds universal IDs) ----------------
-
-def ensure_mergedClusterDict_always(
-    concat_libs: bool,
-    phase: str,
-    merged_out_path: str,
-    loci_table_df,
-    allClusters_df,
-    memFile: str | None,
-):
-    """
-    Always return a dict universal_id -> [member clusterIDs] and ensure the tab exists.
-    In concat mode we derive universal IDs (chr:start..end) from {phase}_merged_candidates.tab.
-    In non-concat mode we do the real cross-lib merge via the parametric path.
-    Also caches a reverse map (clusterID -> universalID) for later lookups.
-    """
-    dict_tab = phase2_basename('mergedClusterDict.tab')
-
-    # If a dict tab already exists, load and cache both directions.
-    if os.path.isfile(dict_tab):
-        try:
-            mcd = _load_simple_tab_dict(dict_tab)
-            globals()["mergedClusterDict"] = mcd
-            _set_reverse_merged_map(mcd)
-            return mcd
-        except Exception as e:
-            print(f"[WARN] Failed to load {dict_tab}: {e}. Recomputing…")
-
-    if concat_libs:
-        # Build universal IDs from the merged candidates TSV:
-        #   expect columns like: Cluster, chromosome/chr, Start/start, End/end
-        if not os.path.isfile(merged_out_path):
-            raise FileNotFoundError(f"Missing merged candidates TSV: {merged_out_path}")
-
-        try:
-            mdf = pd.read_csv(merged_out_path, sep="\t", engine="python")
-        except Exception:
-            mdf = pd.read_csv(merged_out_path, sep="\t", header=None, engine="python")
-            if mdf.shape[1] >= 1:
-                mdf.columns = ["Cluster"] + [f"col{i}" for i in range(2, mdf.shape[1] + 1)]
-
-        cid_col   = next((c for c in ("Cluster","clusterID","name","cID") if c in mdf.columns), None)
-        chr_col   = next((c for c in ("chromosome","chr")               if c in mdf.columns), None)
-        start_col = next((c for c in ("Start","start","begin")          if c in mdf.columns), None)
-        end_col   = next((c for c in ("End","end","stop")               if c in mdf.columns), None)
-        if not all([cid_col, chr_col, start_col, end_col]):
-            raise ValueError(f"{merged_out_path} lacks required columns (have: {list(mdf.columns)})")
-        mcd = defaultdict(list)
-        for cid, achr, s, e in mdf[[cid_col, chr_col, start_col, end_col]].itertuples(index=False):
-            try:
-                u = f"{str(achr)}:{int(s)}..{int(e)}"
-            except Exception:
-                # be forgiving if Start/End are strings already containing ints
-                u = f"{str(achr)}:{str(s)}..{str(e)}"
-            mcd[u].append(str(cid))
-
-        # dedup + sort for stability
-        mcd = {u: sorted(set(vs)) for u, vs in mcd.items()}
-
-        # persist tab
-        with open(dict_tab, "w", newline="") as fh:
-            wr = csv.writer(fh, delimiter="\t")
-            for key, values in mcd.items():
-                wr.writerow([key] + values)
-
-        # cache both directions
-        globals()["mergedClusterDict"] = mcd
-        _set_reverse_merged_map(mcd)
-        return mcd
-
-    # Non-concat: perform true cross-lib merge (already returns universal IDs)
-    mcd = merge_candidate_clusters_parametric(loci_table_df, allClusters_df, phase, memFile)
-
-    # persist (for fast reload next runs)
-    with open(dict_tab, "w", newline="") as fh:
-        wr = csv.writer(fh, delimiter="\t")
-        for key, values in mcd.items():
-            wr.writerow([key] + values)
-
-    globals()["mergedClusterDict"] = mcd
-    _set_reverse_merged_map(mcd)
-    return mcd
+def ensure_mergedClusterDict_always(*, concat_libs, phase, merged_out_path, loci_table_df, allClusters_df, memFile):
+    return st_ids.ensure_mergedClusterDict_always(
+        concat_libs=concat_libs,
+        phase=phase,
+        merged_out_path=merged_out_path,
+        loci_table_df=loci_table_df,
+        allClusters_df=allClusters_df,
+        memFile=memFile,
+    )
 
 def load_processed_clusters_fallback(phase: str) -> pd.DataFrame:
     """
@@ -3590,216 +3281,6 @@ def load_processed_clusters_fallback(phase: str) -> pd.DataFrame:
         return pd.read_csv(proc_path, sep="\t")
     print(f"[WARN] Processed-clusters fallback not found: {proc_path}")
     return pd.DataFrame()
-
-def build_and_save_phas_clusters(allClusters: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build per-(chromosome, library) sRNA cluster features in parallel and write to TSV.
-    Skips recomputation if the output file exists and matches the hash stored in memFile.
-    Robust to accidentally receiving the 6-col merged-candidates frame: falls back to
-    {phase}_processed_clusters.tab (20-col per-read/per-alignment schema).
-
-    Runtime-first:
-      - prefers phasis.runtime for phase/memFile/concat_libs/outdir (single source of truth)
-      - falls back to legacy globals if runtime fields are unset
-    """
-    print("### Step: Build PHAS clusters per (chromosome, library) — parallel ###")
-
-    phase_local = getattr(rt, "phase", None) or globals().get("phase")
-    memfile_local = getattr(rt, "memFile", None) or globals().get("memFile")
-    concat_local = getattr(rt, "concat_libs", None)
-    if concat_local is None:
-        concat_local = globals().get("concat_libs", False)
-
-
-    output_file = phase2_basename("PHAS_to_detect.tab")
-
-    # ---- required 20-col schema (ORDER MATTERS) ----
-    required_20 = [
-        "alib", "clusterID", "chromosome", "strand", "pos", "len", "hits", "abun",
-        "pval_h_f", "N_f", "X_f", "pval_r_f", "pval_corr_f",
-        "pval_h_r", "N_r", "X_r", "pval_r_r", "pval_corr_r",
-        "tag_id", "tag_seq",
-    ]
-    required_20_set = set(required_20)
-
-    # ---- cache config (memFile might not exist yet; don't let that break the run) ----
-    config = configparser.ConfigParser()
-    config.optionxform = str
-    section_name = "PHAS_TO_DETECT"
-
-    try:
-        if memfile_local and os.path.isfile(memfile_local):
-            config.read(memfile_local)
-    except Exception:
-        pass
-
-    if not config.has_section(section_name):
-        try:
-            config.add_section(section_name)
-        except Exception:
-            pass
-
-    # ---- Early hash check ----
-    if os.path.isfile(output_file):
-        try:
-            _, current_md5 = getmd5(output_file)
-            previous_md5 = None
-            try:
-                previous_md5 = config[section_name].get(output_file)
-            except Exception:
-                previous_md5 = None
-
-            if previous_md5 and previous_md5 == current_md5:
-                print(f"  - Output up-to-date (hash match). Skipping processing: {output_file}")
-                df = pd.read_csv(output_file, sep="\t")
-
-                numeric_allowlist = {
-                    "pos", "len", "hits", "abun",
-                    "pval_h_f", "N_f", "X_f", "pval_r_f", "pval_corr_f",
-                    "pval_h_r", "N_r", "X_r", "pval_r_r", "pval_corr_r",
-                }
-                for col in numeric_allowlist.intersection(df.columns):
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-
-                return df
-        except Exception:
-            pass
-
-    # ---- Accept only the 20-col per-read schema; else load the processed tab ----
-    if not (isinstance(allClusters, pd.DataFrame) and required_20_set.issubset(set(allClusters.columns))):
-        allClusters = load_processed_clusters_fallback(phase_local)
-
-    # ---- If still empty, bail cleanly ----
-    if allClusters is None or getattr(allClusters, "empty", True):
-        print("  - Found 0 (chromosome, library) groups (empty input). Returning empty DataFrame.")
-        return pd.DataFrame(columns=required_20 + ["identifier"])
-
-    # ---- Ensure grouping columns exist / normalize ----
-    if "chromosome" not in allClusters.columns and "chr" in allClusters.columns:
-        allClusters = allClusters.rename(columns={"chr": "chromosome"})
-
-    if "alib" not in allClusters.columns:
-        if concat_local:
-            allClusters = allClusters.copy()
-            allClusters["alib"] = "ALL_LIBS"
-        else:
-            print("[WARN] 'alib' column missing and not in concat mode; returning empty DataFrame.")
-            return pd.DataFrame(columns=required_20 + ["identifier"])
-
-    # ---- Enforce EXACT 20-column payload (drop extras like 'identifier') ----
-    if not required_20_set.issubset(set(allClusters.columns)):
-        allClusters = load_processed_clusters_fallback(phase_local)
-        if allClusters is None or getattr(allClusters, "empty", True):
-            print("  - Input invalid and fallback empty; returning empty DataFrame.")
-            return pd.DataFrame(columns=required_20 + ["identifier"])
-
-    allClusters = allClusters.loc[:, required_20].copy()
-
-    # ---- Ensure universal ID mapping is READY BEFORE forking/spawning ----
-    # This is the critical “current issue” fix: workers were dropping everything because
-    # getUniversalID() could not resolve clusterIDs -> universal IDs.
-    try:
-        ensure_mergedClusterDict(phase_local)
-    except Exception:
-        pass
-
-    try:
-        _ensure_reverse_index()
-    except Exception:
-        pass
-
-    # Quick sanity check (cheap) — if mapping fails completely, parallel work will be empty
-    try:
-        sample = allClusters["clusterID"].astype(str).head(50).tolist()
-        ok = sum(1 for cid in sample if getUniversalID(cid) is not None)
-        if ok == 0 and sample:
-            print("[WARN] Universal ID mapping returned 0/50 hits in parent process. "
-                  "Workers will likely return empty. Check mergedClusterDict/reverse map wiring.")
-    except Exception:
-        pass
-
-    # ---- Group → ((chromosome, library), loci_list) ----
-    cluster_groups = [
-        ((chromosome, alib), df.values.tolist())
-        for (chromosome, alib), df in allClusters.groupby(["chromosome", "alib"], sort=False)
-    ]
-    print(f"  - Found {len(cluster_groups)} (chromosome, library) groups")
-
-    if not cluster_groups:
-        print("  - No groups to process. Returning empty DataFrame.")
-        return pd.DataFrame(columns=required_20 + ["identifier"])
-
-    processed_results = run_parallel_with_progress(
-        process_phas_cluster_group,
-        cluster_groups,
-        desc="Building PHAS cluster groups",
-        min_chunk=1,
-        unit="lib-chr",
-    )
-
-    if not processed_results:
-        print("  - Worker returned no results. Returning empty DataFrame.")
-        return pd.DataFrame(columns=required_20 + ["identifier"])
-
-    # Surface worker failures if they were wrapped
-    worker_errors = [r for r in processed_results if isinstance(r, RuntimeError)]
-    if worker_errors:
-        print("[WARN] One or more worker tasks failed; filtering to successful results. First error:")
-        print(worker_errors[0])
-
-    processed_frames = [r for r in processed_results if isinstance(r, pd.DataFrame) and not r.empty]
-    if not processed_frames:
-        print("  - All worker results empty. Returning empty DataFrame.")
-        return pd.DataFrame(columns=required_20 + ["identifier"])
-
-    clusters_data = pd.concat(processed_frames, ignore_index=True)
-
-    # ---- Write + update md5 cache (best effort) ----
-    clusters_data.to_csv(output_file, sep="\t", encoding="utf-8", index=False)
-
-    if os.path.isfile(output_file):
-        try:
-            _, new_md5 = getmd5(output_file)
-            try:
-                config[section_name][output_file] = new_md5
-            except Exception:
-                pass
-
-            try:
-                if memfile_local:
-                    with open(memfile_local, "w") as fh:
-                        config.write(fh)
-            except Exception:
-                pass
-
-            print(f"  - Wrote {output_file} (md5: {new_md5})")
-        except Exception:
-            print(f"  - Wrote {output_file}")
-
-    return clusters_data
-
-
-def process_phas_cluster_group(group):
-    """
-    Process one group of loci: ((chromosome, alib), loci_group-as-list) -> DataFrame
-    Adds 'chromosome' and 'alib' columns to the processed DataFrame.
-    """
-    (chromosome, alib), loci_group = group
-    processed_df = process_chromosome_data(loci_group)  # existing worker
-    processed_df['chromosome'] = chromosome
-    processed_df['alib'] = alib
-    return processed_df
-
-def fishers(pvals):
-    #print("#### Combine p-vals ######")
-    '''
-    combine pvals using fishers method
-    '''
-
-    apval = combine_pvalues(pvals, method='fisher', weights=None)
-    #print("Fishers:",apval) ## return test statistics and pval
-
-    return apval[1]
 
 def _normalize_cluster_df(df: pd.DataFrame, is_concat: bool) -> pd.DataFrame:
     """
@@ -3830,390 +3311,6 @@ def _safe_key(s: str) -> str:
     allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
     return "".join(ch if ch in allowed else "_" for ch in str(s))
 
-
-# --- UPDATED: select_scoring_windows with per‑lib‑chr caching ---
-
-def select_scoring_windows(clusters_data: pd.DataFrame) -> pd.DataFrame:
-    """
-    For each chromosome (and library, if present), slide a fixed-length window across each
-    cluster (>= minClusterLength) and record the best corrected p-values per window
-    (forward/reverse) and their product.
-
-    NEW: Resume‑safe chunked execution — each lib‑chr is written to {phase}_windows/<lib>__chr<id>.tsv
-    and re-used on subsequent runs if the chunk file already exists (no md5/input checks for speed).
-
-    Final merged output is written to {phase}_clusters_windows_to_score.tsv and cached in memFile.
-    Safe on empty/partial input and cache hits.
-    """
-    print("### Step: select scoring windows per chromosome ###")
-
-    outfname = phase2_basename('clusters_windows_to_score.tsv')
-    # Encode key runtime params in the directory name to segregate caches across settings
-    _sl = globals().get('sliding', 'NA')
-    _wl = globals().get('window_len', 'NA')
-    _mcl = globals().get('minClusterLength', 'NA')
-    outdir = phase2_basename(f"windows_sl{_sl}_wl{_wl}_mcl{_mcl}")  # e.g., "24_windows_sl8_wl26_mcl200"
-    os.makedirs(outdir, exist_ok=True)
-
-    # --- memFile / config setup ---
-    cfg = configparser.ConfigParser()
-    cfg.optionxform = str
-    cfg.read(memFile)
-    sec_final = "WINDOWS_TO_SCORE"
-    if not cfg.has_section(sec_final):
-        cfg.add_section(sec_final)
-
-    # Early return on final up-to-date file (hash match)
-    if os.path.isfile(outfname):
-        _, cur_md5 = getmd5(outfname)
-        prev_md5   = cfg[sec_final].get(outfname)
-        if prev_md5 and prev_md5 == cur_md5:
-            print(f"  - Output up-to-date (hash match). Skipping computation: {outfname}")
-            df = pd.read_csv(outfname, sep="\t")
-            numeric_allowlist = {"window_n", "fw_pval_corr", "rv_pval_corr", "combined_window_p_value"}
-            for c in df.columns:
-                if c in numeric_allowlist:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-            return df
-
-    # --- Normalize/guard input ---
-    required_in = ['clusterID', 'pos', 'pval_corr_f', 'pval_corr_r', 'chromosome']
-
-    if clusters_data is None or getattr(clusters_data, "empty", True):
-        print("[INFO] No clusters to select windows from; writing empty output.")
-        empty_out = pd.DataFrame(columns=['cluster_id', 'window_n', 'fw_pval_corr', 'rv_pval_corr', 'combined_window_p_value'])
-        empty_out.to_csv(outfname, sep="\t", index=False)
-        _, out_md5 = getmd5(outfname)
-        cfg[sec_final][outfname] = out_md5
-        with open(memFile, 'w') as fh:
-            cfg.write(fh)
-        return empty_out
-
-    if 'chromosome' not in clusters_data.columns and 'chr' in clusters_data.columns:
-        clusters_data = clusters_data.rename(columns={'chr': 'chromosome'})
-
-    missing = [c for c in required_in if c not in clusters_data.columns]
-    if missing:
-        print(f"[WARN] select_scoring_windows: missing columns {missing}; creating placeholders.")
-        num_like = {'pos', 'pval_corr_f', 'pval_corr_r'}
-        for c in missing:
-            clusters_data[c] = pd.Series(dtype=("float64" if c in num_like else "object"))
-
-    clusters_data = clusters_data[required_in + (["alib"] if "alib" in clusters_data.columns else [])].copy()
-    if clusters_data.empty:
-        print("[INFO] Required columns present but input empty after filtering; writing empty output.")
-        empty_out = pd.DataFrame(columns=['cluster_id', 'window_n', 'fw_pval_corr', 'rv_pval_corr', 'combined_window_p_value'])
-        empty_out.to_csv(outfname, sep="\t", index=False)
-        _, out_md5 = getmd5(outfname)
-        cfg[sec_final][outfname] = out_md5
-        with open(memFile, 'w') as fh:
-            cfg.write(fh)
-        return empty_out
-
-    # --- Build lib‑chr groups ---
-    grouping = ['chromosome'] + (["alib"] if 'alib' in clusters_data.columns else [])
-    groups = [(k, df) for k, df in clusters_data.groupby(grouping, sort=False)]
-    print(f"  - Found {len(groups)} group(s) by {grouping}")
-    # Resume policy: existence-only for chunk files (no md5/inputs to avoid overhead)
-
-    # --- Plan tasks with cache checks ---
-    tasks = []
-    kept_paths = []  # paths we will merge (cached + newly written)
-    for key_tuple, gdf in groups:
-        # key normalization
-        if isinstance(key_tuple, tuple):
-            chrom = key_tuple[0]
-            libid = key_tuple[1] if len(key_tuple) > 1 else 'concat'
-        else:
-            chrom = key_tuple
-            libid = 'concat'
-        key   = f"{libid}__chr{chrom}"
-        outp  = os.path.join(outdir, f"{_safe_key(key)}.tsv")
-
-        # Fast resume: if file exists and is non-empty, reuse it without hashing
-        if os.path.isfile(outp) and os.path.getsize(outp) > 0:
-            kept_paths.append(outp)
-            continue
-
-        tasks.append({
-            'key': key,
-            'df': gdf,
-            'outpath': outp,
-        })
-
-    print(f"  - {len(kept_paths)} cached chunk(s) will be reused; {len(tasks)} chunk(s) to compute")
-
-    results = []
-    if tasks:
-        # Parallel compute; each worker writes its own chunk then returns hashes
-        results = run_parallel_with_progress(
-            select_windows_task_worker,
-            tasks,
-            desc="Selecting windows (resume‑safe)",
-            min_chunk=1,
-            batch_factor=5,
-            unit="lib-chr",
-        ) or []
-
-    # Update cache records for newly produced chunks
-    for r in results:
-        if not r:
-            continue
-        outp = r.get('outpath')
-        if outp:
-            kept_paths.append(outp)
-
-    # Merge all chunk files (order by path for reproducibility)
-    kept_paths = sorted(set(kept_paths))
-    frames = []
-    for p in kept_paths:
-        if os.path.isfile(p) and os.path.getsize(p) > 0:
-            try:
-                frames.append(pd.read_csv(p, sep='\t'))
-            except Exception as e:
-                print(f"[WARN] Could not read chunk {p}: {e}")
-    if frames:
-        to_score = pd.concat(frames, ignore_index=True)
-        # Optional: enforce dtypes
-        for c in ("window_n", "fw_pval_corr", "rv_pval_corr", "combined_window_p_value"):
-            if c in to_score.columns:
-                to_score[c] = pd.to_numeric(to_score[c], errors="coerce")
-        # Optional, reproducible ordering
-        sort_cols = [c for c in ("cluster_id", "window_n") if c in to_score.columns]
-        if sort_cols:
-            to_score = to_score.sort_values(sort_cols, kind="mergesort")
-    else:
-        to_score = pd.DataFrame(columns=['cluster_id', 'window_n', 'fw_pval_corr', 'rv_pval_corr', 'combined_window_p_value'])
-
-    # --- Write final + hash ---
-    to_score.to_csv(outfname, sep="\t", index=False)
-    if os.path.isfile(outfname):
-        _, out_md5 = getmd5(outfname)
-        cfg[sec_final][outfname] = out_md5
-        with open(memFile, 'w') as fh:
-            cfg.write(fh)
-        print(f"  - Wrote {outfname} (md5: {out_md5})\n    Cached chunks directory: {outdir}")
-
-    return to_score
-
-
-# --- NEW WORKER: write chunk to file and return hashes ---
-
-def select_windows_task_worker(task: dict):
-    """Worker wrapper that computes windows for a task and writes TSV to task['outpath'].
-    Returns a dict with {'outpath'} for bookkeeping.
-    """
-    outpath = task['outpath']
-    df = task['df']
-    rows = select_windows_for_chromosome(df)  # existing logic
-
-    # Ensure directory exists (defensive)
-    os.makedirs(os.path.dirname(outpath), exist_ok=True)
-
-    if not rows:
-        pd.DataFrame(columns=['cluster_id', 'window_n', 'fw_pval_corr', 'rv_pval_corr', 'combined_window_p_value']).to_csv(outpath, sep='\t', index=False)
-    else:
-        pd.DataFrame(rows, columns=['cluster_id', 'window_n', 'fw_pval_corr', 'rv_pval_corr', 'combined_window_p_value']).to_csv(outpath, sep='\t', index=False)
-
-    # Hash the produced file
-    return {'outpath': outpath, 'key': task.get('key')}
-
-
-
-'''def select_scoring_windows(clusters_data: pd.DataFrame) -> pd.DataFrame:
-    """
-    For each chromosome, slide a fixed-length window across each cluster (>= minClusterLength)
-    and record the best corrected p-values per window (forward/reverse) and their product.
-    Results are written to {phase}_clusters_windows_to_score.tsv and cached in memFile.
-    Safe on empty/partial input and cache hits.
-    """
-    print("### Step: select scoring windows per chromosome ###")
-
-    outfname = phase2_basename('clusters_windows_to_score.tsv')
-
-    # --- Early hash check ---
-    cfg = configparser.ConfigParser()
-    cfg.optionxform = str
-    cfg.read(memFile)
-    section = "WINDOWS_TO_SCORE"
-    if not cfg.has_section(section):
-        cfg.add_section(section)
-
-    if os.path.isfile(outfname):
-        _, cur_md5 = getmd5(outfname)
-        prev_md5 = cfg[section].get(outfname)
-        if prev_md5 and prev_md5 == cur_md5:
-            print(f"  - Output up-to-date (hash match). Skipping computation: {outfname}")
-            df = pd.read_csv(outfname, sep="\t")
-            # Only coerce known numeric columns from this TSV
-            numeric_allowlist = {"window_n", "fw_pval_corr", "rv_pval_corr", "combined_window_p_value"}
-            for c in df.columns:
-                if c in numeric_allowlist:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-            return df
-
-    # --- Normalize/guard input ---
-    # Expected input columns for this step
-    required_in = ['clusterID', 'pos', 'pval_corr_f', 'pval_corr_r', 'chromosome']
-
-    # Handle None/empty
-    if clusters_data is None or getattr(clusters_data, "empty", True):
-        print("[INFO] No clusters to select windows from; writing empty output.")
-        empty_out = pd.DataFrame(columns=['cluster_id', 'window_n', 'fw_pval_corr', 'rv_pval_corr', 'combined_window_p_value'])
-        empty_out.to_csv(outfname, sep="\t", index=False)
-        _, out_md5 = getmd5(outfname)
-        cfg[section][outfname] = out_md5
-        with open(memFile, 'w') as fh:
-            cfg.write(fh)
-        return empty_out
-
-    # Rename 'chr' -> 'chromosome' if needed
-    if 'chromosome' not in clusters_data.columns and 'chr' in clusters_data.columns:
-        clusters_data = clusters_data.rename(columns={'chr': 'chromosome'})
-
-    # If any required columns are missing, add safe placeholders (keeps pipeline from crashing)
-    missing = [c for c in required_in if c not in clusters_data.columns]
-    if missing:
-        print(f"[WARN] select_scoring_windows: missing columns {missing}; creating placeholders.")
-        num_like = {'pos', 'pval_corr_f', 'pval_corr_r'}
-        for c in missing:
-            clusters_data[c] = pd.Series(dtype=("float64" if c in num_like else "object"))
-
-    # Use only necessary columns (defensive copy) — avoids KeyError
-    clusters_data = clusters_data[required_in].copy()
-
-    # If after filtering nothing remains, emit empty file and return
-    if clusters_data.empty:
-        print("[INFO] Required columns present but input empty after filtering; writing empty output.")
-        empty_out = pd.DataFrame(columns=['cluster_id', 'window_n', 'fw_pval_corr', 'rv_pval_corr', 'combined_window_p_value'])
-        empty_out.to_csv(outfname, sep="\t", index=False)
-        _, out_md5 = getmd5(outfname)
-        cfg[section][outfname] = out_md5
-        with open(memFile, 'w') as fh:
-            cfg.write(fh)
-        return empty_out
-
-    # --- Split per chromosome (keep original order) ---
-    chromosome_groups = [df for _, df in clusters_data.groupby('chromosome', sort=False)]
-    print(f"  - Found {len(chromosome_groups)} chromosome groups")
-
-    if not chromosome_groups:
-        print("[INFO] No chromosome groups found; writing empty output.")
-        empty_out = pd.DataFrame(columns=['cluster_id', 'window_n', 'fw_pval_corr', 'rv_pval_corr', 'combined_window_p_value'])
-        empty_out.to_csv(outfname, sep="\t", index=False)
-        _, out_md5 = getmd5(outfname)
-        cfg[section][outfname] = out_md5
-        with open(memFile, 'w') as fh:
-            cfg.write(fh)
-        return empty_out
-
-    # --- Parallel worker ---
-    results = run_parallel_with_progress(
-        select_windows_for_chromosome,   # your existing worker
-        chromosome_groups,
-        desc="Selecting windows",
-        min_chunk=1,
-        batch_factor = 5,
-        unit="lib-chr"
-    )
-
-    # Flatten and build output frame (robust to empty/None items)
-    flat = []
-    for r in results or []:
-        if r:
-            flat.extend(r)
-
-    to_score = pd.DataFrame(
-        flat,
-        columns=['cluster_id', 'window_n', 'fw_pval_corr', 'rv_pval_corr', 'combined_window_p_value']
-    )
-
-    # --- Write + hash (even if empty, to stabilize caching) ---
-    to_score.to_csv(outfname, sep="\t", index=False)
-    if os.path.isfile(outfname):
-        _, out_md5 = getmd5(outfname)
-        cfg[section][outfname] = out_md5
-        with open(memFile, 'w') as fh:
-            cfg.write(fh)
-        print(f"  - Wrote {outfname} (md5: {out_md5})")
-
-    return to_score'''
-
-def select_windows_for_chromosome(chromosome_df: pd.DataFrame):
-    """
-    Process window selection for a single chromosome DataFrame.
-    Expected columns: clusterID, pos, pval_corr_f, pval_corr_r
-    Returns list of [cluster_id, window_n, best_f, best_r, best_f*best_r]
-    """
-    # Keep only needed cols (defensive)
-    df = chromosome_df[['clusterID', 'pos', 'pval_corr_f', 'pval_corr_r']].copy()
-
-    # Ensure numeric types for computations (once per group)
-    df['pos']         = pd.to_numeric(df['pos'], errors='coerce')
-    df['pval_corr_f'] = pd.to_numeric(df['pval_corr_f'], errors='coerce')
-    df['pval_corr_r'] = pd.to_numeric(df['pval_corr_r'], errors='coerce')
-
-    # Drop rows with missing positions
-    df = df.dropna(subset=['pos'])
-    if df.empty:
-        return []
-
-    to_score = []
-    append = to_score.append  # micro-opt
-
-    for cID, aclust in df.groupby('clusterID', sort=False):
-        if aclust.empty:
-            continue
-
-        # Check if positions are already sorted; sort only if needed
-        pos = aclust['pos'].to_numpy()
-        if pos.size == 0:
-            continue
-        # allow ties (<=). Using vectorized check avoids Python loops
-        if not (pos[:-1] <= pos[1:]).all():
-            aclust = aclust.sort_values('pos', kind='mergesort')
-            pos = aclust['pos'].to_numpy()
-
-        fw = aclust['pval_corr_f'].to_numpy()
-        rv = aclust['pval_corr_r'].to_numpy()
-
-        # Replace non-finite with +inf so they don't affect minima
-        fw = np.where(np.isfinite(fw), fw, np.inf)
-        rv = np.where(np.isfinite(rv), rv, np.inf)
-
-        # Cluster span in genomic coordinates
-        cluster_start = int(pos[0])
-        cluster_end   = int(pos[-1])
-        cluster_len   = cluster_end - cluster_start
-        if cluster_len < minClusterLength or cluster_len < window_len:
-            continue
-
-        # Number of windows and starts/ends (half-open [start, end))
-        nwin = 1 + (cluster_len - window_len) // sliding
-        if nwin <= 0:
-            continue
-        w_starts = cluster_start + np.arange(0, nwin * sliding, sliding, dtype=np.int64)
-        w_ends   = w_starts + window_len
-
-        # Index bounds for each window in O(log N)
-        left_idx  = np.searchsorted(pos, w_starts, side='left')
-        right_idx = np.searchsorted(pos, w_ends,   side='left')  # half-open
-
-        for w_i in range(nwin):
-            li = left_idx[w_i]
-            ri = right_idx[w_i]
-            if li >= ri:
-                continue
-
-            best_f = fw[li:ri].min()
-            best_r = rv[li:ri].min()
-
-            if not np.isfinite(best_f) or not np.isfinite(best_r):
-                continue
-
-            append([cID, w_i, best_f, best_r, best_f * best_r])
-
-    return to_score
 
 
 # Global variables
@@ -4792,6 +3889,14 @@ def merge_candidate_clusters_across_libs(loci_table_path: str, out_path: str, **
     """Legacy compatibility wrapper → stage implementation."""
     return st_cmerge.merge_candidate_clusters_across_libs(loci_table_path, out_path, **kwargs)
 
+def build_and_save_phas_clusters(allClusters):
+    return st_phas_clusters.build_and_save_phas_clusters(allClusters)
+
+def select_scoring_windows(clusters_data, **kwargs):
+    return st_winsel.select_scoring_windows(clusters_data, **kwargs)
+
+def run_phase2(clusterFilePaths, cfg: Phase2Config | None = None):
+    return run_phase2_pipeline(clusterFilePaths, cfg=cfg)
 
 def run_phase1(libs):
     """
@@ -4827,126 +3932,6 @@ def run_phase1(libs):
     return clusterFilePaths
 
 
-def run_phase2(clusterFilePaths, cfg: Phase2Config | None = None):
-    """
-    Phase II (class): merge candidates, ensure universal IDs, build clusters,
-    select windows, score, feature assembly, classify, and write outputs/plots.
-    """
-
-    print("######            Starting Phase II          #########")
-    if cfg is None:
-        cfg = Phase2Config.from_runtime()
-    # If running 'class' only, take precomputed cluster files
-    if cfg.steps == 'class':
-        clusterFilePaths = cfg.class_cluster_file
-
-
-    # 1) Aggregate for side-effects (writes processed clusters)
-    agg_df = aggregate_and_write_processed_clusters(clusterFilePaths)
-
-    # Build "allClusters" baseline from aggregator result or file fallback
-    if agg_df is not None:
-        allClusters = agg_df
-    else:
-        proc_path = phase2_basename('processed_clusters.tab')
-        allClusters = (
-            pd.read_csv(proc_path, sep="\t") if os.path.isfile(proc_path) else pd.DataFrame()
-        )
-
-    # Normalize for downstream grouping
-    allClusters = _normalize_cluster_df(allClusters, is_concat=cfg.concat_libs)
-
-    # 2) ALWAYS emit loci table BEFORE merge (guarantees the input exists for merge)
-    loci_table_df   = loci_table_from_clusters(allClusters)  # writes {phase}_candidate.loci_table.tab
-    loci_table_path = phase2_basename('candidate.loci_table.tab')
-
-    # 3) Build the DataFrame used downstream
-    merged_out_path = phase2_basename('merged_candidates.tab')
-    if cfg.concat_libs:
-        # Cache-aware merge: returns a DataFrame (loads TSV on cache hit)
-        allClustersMerged = merge_candidate_clusters_across_libs(
-            loci_table_path, merged_out_path
-        )
-    else:
-        # Non-concat: analysis continues with the pre-merge representation
-        # (cross-lib overlap merging for universal IDs is handled right below)
-        allClustersMerged = allClusters
-
-    # 3.5) Always ensure universal-ID dict (used by getUniversalID)
-    #      In concat mode: load/write identity dict from merged TSV if needed.
-    #      In non-concat: perform cross-lib merging via parametric path.
-    mcd = ensure_mergedClusterDict_always(
-        concat_libs=concat_libs,
-        phase=phase,
-        merged_out_path=merged_out_path,
-        loci_table_df=loci_table_df,
-        allClusters_df=allClusters,
-        memFile=memFile
-    )
-    globals()['mergedClusterDict'] = mcd
-    print(f"[INFO] mergedClusterDict ready with {len(mcd)} universal IDs.")
-
-    # 4) Build PHAS clusters (handles empty input)
-    clusters_data = build_and_save_phas_clusters(allClusters)
-
-    # 5) If there are no clusters, short-circuit cleanly
-    if clusters_data is None or getattr(clusters_data, "empty", True):
-        print("[INFO] No PHAS clusters to score; exiting classification early.")
-
-    # 6) Select windows (cache-aware and robust)
-    clusters = select_scoring_windows(clusters_data)
-    if clusters is None or getattr(clusters, "empty", True):
-        print("[INFO] No scoring windows found; exiting classification early.")
-
-    # 7) Score windows, expose compact lookup to workers, extract features, classify
-    win_phasis_score = compute_and_save_phasis_scores(clusters)
-
-    # Make the compact, read-only lookup visible to workers (for process_chromosome_features)
-    set_win_score_lookup(win_phasis_score)
-
-    features = features_to_detection(
-        clusters_data,
-        phase=cfg.phase,
-        outdir=cfg.outdir,
-        concat_libs=cfg.concat_libs,
-        memFile=cfg.memFile,
-    )
-    if cfg.classifier == "GMM":
-        GMM_phas_clustering(features, cfg=cfg)
-    elif cfg.classifier == "KNN":
-        KNN_phas_clustering(features, cfg=cfg)
-
-def main(libs):
-    """
-    Orchestrates the pipeline (concat- and non-concat-safe).
-
-    Guarantees:
-      - {phase}_candidate.loci_table.tab is written before any merging.
-      - mergedClusterDict is ALWAYS available for getUniversalID(), in both modes.
-      - WIN_SCORE_LOOKUP is set after window scoring so workers can read it.
-
-    Notes:
-      - Respects hash/caching behavior inside called steps.
-      - Early exits if no clusters/windows.
-    """
-    warnings.filterwarnings("ignore", category=UserWarning)
-    warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-    clusterFilePaths = None
-    # make it globally available
-    print(f"Output directory: {outdir}")
-
-    # -------------------------- PART I: cfind --------------------------
-    if (steps == 'both') or (steps == 'cfind'):
-        clusterFilePaths = run_phase1(libs)
-
-    # -------------------------- PART II: class -------------------------
-    if (steps == 'both') or (steps == 'class'):
-        run_phase2(clusterFilePaths)
-
-    return None
-
-
 
 def legacy_entrypoint():
     global ncores, libs
@@ -4966,8 +3951,23 @@ def legacy_entrypoint():
     libs = libs_checked
     rt.libs = libs_checked
 
-    main(libs_checked)
-    
+    # ---- dispatcher (replaces legacy main()) ----
+    steps_local = getattr(rt, "steps", None) or globals().get("steps", "both")
+    steps_local = str(steps_local).strip().lower()
+
+    if steps_local == "cfind":
+        run_phase1(libs_checked)
+    elif steps_local == "class":
+        # run_phase2() will pull cfg from runtime and override clusterFilePaths
+        run_phase2([])
+    elif steps_local == "both":
+        clusterFilePaths = run_phase1(libs_checked)
+        run_phase2(clusterFilePaths)
+    else:
+        raise ValueError(
+            f"Unknown steps value: {steps_local!r} (expected 'cfind', 'class', or 'both')"
+        )
+
+
 if __name__ == "__main__":
     legacy_entrypoint()
-

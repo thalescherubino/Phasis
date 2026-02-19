@@ -17,14 +17,22 @@ class Phase2Config:
     steps: str
     class_cluster_file: Any
 
+    # window selection / clustering params (Phase II)
+    # NOTE: These live in runtime as rt.window_len / rt.sliding / rt.minClusterLength.
+    # We give them defaults so older call sites that instantiate Phase2Config manually
+    # won't break during migration.
+    window_len: int = 0
+    sliding: int = 0
+    minClusterLength: int = 0
+
     # classification
-    classifier: str
-    phasisScoreCutoff: float
-    min_Howell_score: float
-    max_complexity: float
+    classifier: str = ""
+    phasisScoreCutoff: float = 0.0
+    min_Howell_score: float = 0.0
+    max_complexity: float = 1.0
 
     # cache
-    memFile: Optional[str]
+    memFile: Optional[str] = None
 
     @classmethod
     def from_runtime(cls) -> "Phase2Config":
@@ -34,9 +42,12 @@ class Phase2Config:
             concat_libs=bool(getattr(rt, "concat_libs", False)),
             steps=str(getattr(rt, "steps", "")),
             class_cluster_file=getattr(rt, "class_cluster_file", None),
+            window_len=int(getattr(rt, "window_len", 0) or 0),
+            sliding=int(getattr(rt, "sliding", 0) or 0),
+            minClusterLength=int(getattr(rt, "minClusterLength", 0) or 0),
             classifier=str(getattr(rt, "classifier", "")),
-            phasisScoreCutoff=float(getattr(rt, "phasisScoreCutoff", 0.0)),
-            min_Howell_score=float(getattr(rt, "min_Howell_score", 0.0)),
-            max_complexity=float(getattr(rt, "max_complexity", 1.0)),
+            phasisScoreCutoff=float(getattr(rt, "phasisScoreCutoff", 0.0) or 0.0),
+            min_Howell_score=float(getattr(rt, "min_Howell_score", 0.0) or 0.0),
+            max_complexity=float(getattr(rt, "max_complexity", 1.0) or 1.0),
             memFile=getattr(rt, "memFile", None),
         )
