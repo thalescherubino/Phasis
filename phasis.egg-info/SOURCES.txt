@@ -25,7 +25,12 @@ phasis/stages/__init__.py
 phasis/stages/candidates_merge.py
 phasis/stages/classify.py
 phasis/stages/cluster_aggregation.py
+phasis/stages/cluster_build.py
 phasis/stages/feature_assembly.py
 phasis/stages/output.py
 phasis/stages/phas_clusters.py
+phasis/stages/phase1_pipeline.py
+phasis/stages/phase2_pipeline.py
+phasis/stages/sam_parsing.py
 phasis/stages/window_scoring.py
+phasis/stages/window_selection.py

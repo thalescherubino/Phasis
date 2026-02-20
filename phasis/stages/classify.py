@@ -15,7 +15,13 @@ import pandas as pd
 from sklearn import preprocessing
 from sklearn.mixture import GaussianMixture
 import joblib
+import warnings
 
+warnings.filterwarnings(
+    "ignore",
+    message=r"X does not have valid feature names, but KNeighborsClassifier was fitted with feature names",
+    category=UserWarning,
+)
 
 # Keep the exact feature set that legacy.py uses for KNN/GMM
 KNN_FEATURE_COLS = [

@@ -1,0 +1,382 @@
+
+from __future__ import annotations
+
+import os
+import re
+import gc
+import pickle
+import shutil
+import configparser
+import multiprocessing
+from collections import OrderedDict
+
+import phasis.runtime as rt
+from phasis.cache import MEM_FILE_DEFAULT, getmd5
+from phasis.parallel import run_parallel_with_progress, make_pool
+
+
+def _safe_key(s: str) -> str:
+    """Filesystem-safe key for cache files."""
+    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+    return "".join(ch if ch in allowed else "_" for ch in str(s))
+
+
+def canonicalize_akey(s: str) -> str:
+    """Return 'LIB-CHR' from any akey-like string without destroying dots in LIB."""
+    base = os.path.basename(str(s)).strip()
+
+    for suf in (".lclust", ".sclust"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+
+    m = re.search(r"([A-Za-z0-9._+-]+-\d+)$", base)
+    if m:
+        return m.group(1)
+
+    return base
+
+
+def _flush_prev_cluster(prev_merged, clustid, clustlen_cutoff, clustdict_long, clustdict_short):
+    """Legacy helper: finalize one merged cluster into long/short dicts."""
+    if prev_merged:
+        clustid += 1
+        leftx = prev_merged[0]
+        rightx = prev_merged[-1]
+        if (rightx - leftx) + 1 > clustlen_cutoff:
+            clustdict_long[clustid] = prev_merged
+        elif len(prev_merged) > 1:
+            clustdict_short[clustid] = prev_merged
+        prev_merged = []
+    return prev_merged, clustid
+
+
+def getclusters(args):
+    """
+    Compute clusters for one (akey, acounter) and write to disk immediately.
+
+    Returns: (akey, lclust_file, sclust_file, lclust_md5)
+
+    NOTE: spawn-safe: derives all parameters from rt.* inside the worker.
+    """
+    akey, acounter, clustfolder = args
+
+    phase = int(rt.phase)
+    clustbuffer = int(rt.clustbuffer)
+    clustsplit = phase + 1 + 3
+    clustlen_cutoff = phase * 4 + 3 + 1
+
+    akey_safe = canonicalize_akey(akey)
+    lclust_file = os.path.join(clustfolder, f"{akey_safe}.lclust")
+    sclust_file = os.path.join(clustfolder, f"{akey_safe}.sclust")
+
+    if isinstance(acounter, OrderedDict):
+        keys_iter = acounter.keys()
+    else:
+        try:
+            keys_iter = sorted(acounter.keys(), key=int)
+        except Exception:
+            keys_iter = sorted(acounter.keys())
+
+    it = iter(keys_iter)
+    try:
+        first_key = next(it)
+    except StopIteration:
+        with open(lclust_file, "wb") as f1, open(sclust_file, "wb") as f2:
+            pickle.dump({}, f1, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump({}, f2, protocol=pickle.HIGHEST_PROTOCOL)
+        _, lclust_md5 = getmd5(lclust_file)
+        return (akey, lclust_file, sclust_file, lclust_md5)
+
+    try:
+        first_pos = int(first_key)
+    except Exception:
+        first_pos = first_key
+
+    clustdict_long = {}
+    clustdict_short = {}
+    clustid = 0
+
+    prev_merged = []
+    curr_pre = [first_pos]
+    last_pos = first_pos
+
+    for k in it:
+        try:
+            pos = int(k)
+        except Exception:
+            pos = k
+
+        if pos - last_pos > clustsplit:
+            if not prev_merged:
+                prev_merged = curr_pre
+            else:
+                if curr_pre[0] <= (prev_merged[-1] + clustbuffer):
+                    prev_merged.extend(curr_pre)
+                else:
+                    prev_merged, clustid = _flush_prev_cluster(
+                        prev_merged, clustid, clustlen_cutoff, clustdict_long, clustdict_short
+                    )
+                    prev_merged = curr_pre
+            curr_pre = [pos]
+        else:
+            curr_pre.append(pos)
+
+        last_pos = pos
+
+    if not prev_merged:
+        prev_merged = curr_pre
+    else:
+        if curr_pre[0] <= (prev_merged[-1] + clustbuffer):
+            prev_merged.extend(curr_pre)
+        else:
+            prev_merged, clustid = _flush_prev_cluster(
+                prev_merged, clustid, clustlen_cutoff, clustdict_long, clustdict_short
+            )
+            prev_merged = curr_pre
+
+    prev_merged, clustid = _flush_prev_cluster(
+        prev_merged, clustid, clustlen_cutoff, clustdict_long, clustdict_short
+    )
+
+    with open(lclust_file, "wb") as f1, open(sclust_file, "wb") as f2:
+        pickle.dump(clustdict_long, f1, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(clustdict_short, f2, protocol=pickle.HIGHEST_PROTOCOL)
+
+    _, lclust_md5 = getmd5(lclust_file)
+
+    del clustdict_long, clustdict_short, prev_merged, curr_pre
+    gc.collect()
+
+    return (akey, lclust_file, sclust_file, lclust_md5)
+
+
+def alt_parallel_process(func, data_chunks):
+    """Fallback clustering runner using make_pool (spawn-safe initializer)."""
+    ncores = rt.ncores
+    if ncores is None or int(ncores) <= 0:
+        ncores = multiprocessing.cpu_count()
+    max_workers = int(ncores)
+
+    with make_pool(max_workers) as pool:
+        for result in pool.imap_unordered(func, data_chunks, chunksize=1):
+            yield result
+
+
+def process_cluster_batch(batch, batch_id):
+    """Run one clustering batch and return results."""
+    try:
+        return run_parallel_with_progress(
+            getclusters, batch, desc=f"Clustering batch {batch_id}", unit="lib-chr"
+        )
+    except Exception as e:
+        print(f"[WARN] run_parallel_with_progress failed on batch {batch_id}: {e}")
+        print("[INFO] Falling back to alternative chunked parallel_process...")
+        try:
+            return list(alt_parallel_process(getclusters, batch))
+        except Exception as ee:
+            print(f"[ERROR] Fallback failed for batch {batch_id}: {ee}")
+            return []
+
+
+def _prune_old_clustered_entries(cfg: configparser.ConfigParser, basename: str, keep_abs: str) -> int:
+    """Remove stale [CLUSTERED] entries with same basename but different path."""
+    if not cfg.has_section("CLUSTERED"):
+        return 0
+    to_delete = [
+        k
+        for k in cfg["CLUSTERED"].keys()
+        if os.path.basename(k) == basename and os.path.realpath(k) != os.path.realpath(keep_abs)
+    ]
+    for k in to_delete:
+        try:
+            cfg.remove_option("CLUSTERED", k)
+        except Exception:
+            pass
+    return len(to_delete)
+
+
+def flush_cluster_batch(
+    batch_items,
+    idx,
+    *,
+    clustfolder,
+    cfg,
+    clustered_md5,
+    results,
+    new_hashes,
+    processed_akeys,
+):
+    """Top-level (non-nested) flush helper to satisfy no-nested-functions rule."""
+    if not batch_items:
+        return
+
+    chunk_results = process_cluster_batch(batch_items, idx)
+    for res in chunk_results:
+        if isinstance(res, RuntimeError):
+            # run_parallel_with_progress returns RuntimeError sentinel on worker failure
+            raise res
+
+        if len(res) == 4:
+            a, lfile, sfile, lmd5 = res
+        else:
+            a, lfile, sfile = res
+            _, lmd5 = getmd5(lfile)
+
+        a_safe = _safe_key(a)
+        want_l = os.path.realpath(os.path.join(clustfolder, f"{a_safe}.lclust"))
+        want_s = os.path.realpath(os.path.join(clustfolder, f"{a_safe}.sclust"))
+
+        # If worker wrote elsewhere, move into clustfolder
+        if os.path.isfile(lfile) and os.path.realpath(lfile) != want_l:
+            try:
+                os.replace(lfile, want_l)
+            except Exception:
+                shutil.copy2(lfile, want_l)
+                try:
+                    os.remove(lfile)
+                except Exception:
+                    pass
+        if os.path.isfile(sfile) and os.path.realpath(sfile) != want_s:
+            try:
+                os.replace(sfile, want_s)
+            except Exception:
+                shutil.copy2(sfile, want_s)
+                try:
+                    os.remove(sfile)
+                except Exception:
+                    pass
+
+        _, lmd5_final = getmd5(want_l)
+        new_hashes[want_l] = lmd5_final
+
+        pruned = _prune_old_clustered_entries(cfg, os.path.basename(want_l), want_l)
+        if pruned:
+            for k in list(clustered_md5.keys()):
+                if os.path.basename(k) == os.path.basename(want_l) and os.path.realpath(k) != want_l:
+                    clustered_md5.pop(k, None)
+
+        clustered_md5[want_l] = lmd5_final
+        results.append((a, want_l, want_s))
+        processed_akeys.append(a)
+
+
+def clusterprocess(libs_poscountdict, clustfolder):
+    """
+    Phase I clustering (spawn-safe, no nested functions).
+
+    - Writes per-lib-chr clusters to <clustfolder>/<akey>.lclust|.sclust
+    - Updates [CLUSTERED] with ABS path under `clustfolder`
+    - Skips recompute when md5 matches current mem entry
+    - Returns: [(akey, lclust_file, sclust_file), ...]
+    """
+    print("#### Fn: Find Clusters #######################")
+
+    os.makedirs(clustfolder, exist_ok=True)
+
+    # Normalize sources
+    if isinstance(libs_poscountdict, (dict, str)):
+        sources = [libs_poscountdict]
+    else:
+        sources = list(libs_poscountdict)
+
+    mem_file = rt.memFile or MEM_FILE_DEFAULT
+
+    cfg = configparser.ConfigParser()
+    cfg.optionxform = str
+    cfg.read(mem_file)
+    if not cfg.has_section("CLUSTERED"):
+        cfg.add_section("CLUSTERED")
+
+    clustered_md5 = dict(cfg["CLUSTERED"])
+
+    results: list[tuple[str, str, str]] = []
+    new_hashes: dict[str, str] = {}
+    processed_akeys: list[str] = []
+
+    CLUSTER_CHUNK_MAX = 10
+    batch = []
+    batch_index = 0
+
+    for src in sources:
+        if isinstance(src, str):
+            try:
+                with open(src, "rb") as fh:
+                    libdict = pickle.load(fh)
+            except Exception:
+                print(f"[WARN] Failed to load count file {src}")
+                continue
+            loaded_from_path = True
+        elif isinstance(src, dict):
+            libdict = src
+            loaded_from_path = False
+        else:
+            print(f"[WARN] Unexpected type in libs_poscountdict: {type(src)} (skipping)")
+            continue
+
+        for akey, positions in libdict.items():
+            a_safe = _safe_key(akey)
+            lclust_path = os.path.realpath(os.path.join(clustfolder, f"{a_safe}.lclust"))
+            sclust_path = os.path.realpath(os.path.join(clustfolder, f"{a_safe}.sclust"))
+
+            # Cache hit?
+            if os.path.isfile(lclust_path):
+                _, cur_md5 = getmd5(lclust_path)
+                prev_md5 = cfg["CLUSTERED"].get(lclust_path, "")
+                if prev_md5 and cur_md5 and prev_md5 == cur_md5:
+                    _prune_old_clustered_entries(cfg, os.path.basename(lclust_path), lclust_path)
+                    results.append((akey, lclust_path, sclust_path))
+                    processed_akeys.append(akey)
+                    continue
+
+            batch.append((akey, positions, clustfolder))
+            if len(batch) >= CLUSTER_CHUNK_MAX:
+                batch_index += 1
+                flush_cluster_batch(
+                    batch,
+                    batch_index,
+                    clustfolder=clustfolder,
+                    cfg=cfg,
+                    clustered_md5=clustered_md5,
+                    results=results,
+                    new_hashes=new_hashes,
+                    processed_akeys=processed_akeys,
+                )
+                batch = []
+                gc.collect()
+
+        if loaded_from_path:
+            del libdict
+            gc.collect()
+
+    if batch:
+        batch_index += 1
+        flush_cluster_batch(
+            batch,
+            batch_index,
+            clustfolder=clustfolder,
+            cfg=cfg,
+            clustered_md5=clustered_md5,
+            results=results,
+            new_hashes=new_hashes,
+            processed_akeys=processed_akeys,
+        )
+        batch = []
+        gc.collect()
+
+    # Persist [CLUSTERED] updates
+    if not cfg.has_section("CLUSTERED"):
+        cfg.add_section("CLUSTERED")
+    for lpath, md5 in new_hashes.items():
+        cfg["CLUSTERED"][lpath] = md5
+    with open(mem_file, "w") as fh:
+        cfg.write(fh)
+
+    # Save akeys list for downstream
+    try:
+        with open(os.path.join(clustfolder, "libchr-keys.p"), "wb") as pf:
+            pickle.dump(processed_akeys, pf)
+    except Exception as e:
+        print(f"[WARN] Could not write libchr-keys.p: {e}")
+
+    return results
