@@ -44,45 +44,6 @@ def _join_outdir(dirpath: str | None, name: str) -> str:
     return dirpath + name if dirpath.endswith("/") else dirpath + "/" + name
 
 
-def _tqdm(iterable, **kwargs):
-    # tqdm is optional; fall back to plain iteration if not available.
-    if tqdm is None:
-        return iterable
-    return tqdm(iterable, **kwargs)
-
-
-def _phase_is_24() -> bool:
-    try:
-        return str(phase) == "24"
-    except Exception:
-        return False
-
-
-def _filter_df_keep_any_phas_call(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For 24-PHAS runs only: keep loci (identifier rows) that have at least one PHAS call
-    in any library. Leave 21-PHAS behavior unchanged.
-    """
-    if not _phase_is_24():
-        return df
-    if df is None or df.empty:
-        return df
-    if "identifier" not in df.columns or "label" not in df.columns:
-        return df
-    keep = df.groupby("identifier")["label"].apply(lambda s: (s == "PHAS").any())
-    keep_ids = keep[keep].index
-    return df[df["identifier"].isin(keep_ids)].copy()
-
-
-def _save_empty_plot(path: str, title: str, message: str) -> None:
-    fig, ax = plt.subplots(figsize=(11, 11))
-    ax.axis("off")
-    ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=14)
-    ax.set_title(title, fontsize=16, pad=20)
-    plt.tight_layout()
-    fig.savefig(path, dpi=300)
-    plt.close(fig)
-
 def _fallback_series(nrows: int) -> pd.Series:
     return pd.Series([np.nan] * int(nrows))
 
@@ -171,45 +132,58 @@ def write_gff(phasis_result_df,gff_filename):
     return None
 
 
-
 def plot_report_heat_map(phasis_result_df, plot_type):
     print("#### Plotting heatmap ######")
 
-    all_libs = sorted(list(phasis_result_df["alib"].unique())) if (phasis_result_df is not None and not phasis_result_df.empty and "alib" in phasis_result_df.columns) else []
+    global outdir, phase
 
-    phasis_result_df = _filter_df_keep_any_phas_call(phasis_result_df)
+    # Keep full library columns (even if no PHAS in some libs)
+    all_libs = sorted(list(phasis_result_df["alib"].unique()))
+
+    # For phase==24: drop loci (rows) that have no PHAS call in any library
+    df = phasis_result_df
+    if str(phase) == "24":
+        ids_with_phas = set(df.loc[df["label"] == "PHAS", "identifier"].unique())
+        df = df[df["identifier"].isin(ids_with_phas)].copy()
+
+        if df.empty:
+            # Nothing to plot; write a small placeholder PDF to avoid errors
+            f, ax = plt.subplots(figsize=(6, 2))
+            ax.axis("off")
+            ax.text(0.01, 0.5, "No 24-PHAS loci detected.", fontsize=12)
+            f.savefig(_join_outdir(outdir, f"{phase}_{plot_type}_PHAS.pdf"), dpi=300)
+            plt.close(f)
+            return
 
     data = pd.DataFrame(
         data=0.0,
-        columns=all_libs,
-        index=list(phasis_result_df["identifier"].unique()) if (phasis_result_df is not None and not phasis_result_df.empty and "identifier" in phasis_result_df.columns) else []
+        columns=all_libs,  # Sorted columns alphanumerically
+        index=list(df["identifier"].unique())
     )
 
-    if data.shape[0] == 0 or data.shape[1] == 0:
-        out = _join_outdir(outdir, f"{phase}_{plot_type}_PHAS.pdf")
-        _save_empty_plot(out, f"{phase}-PHAS {plot_type}", "No loci to plot for this heatmap.")
-        return None
+    it = tqdm(data.index, desc="Processing Rows") if tqdm else data.index
 
     # Iterate over rows and columns to fill heatmap data
-    for i in _tqdm(data.index, desc="Processing Rows"):
-        tempRows = phasis_result_df[phasis_result_df["identifier"] == i]
+    for i in it:
+        tempRows = df[df["identifier"] == i]
         for j in data.columns:
-            k = 1.0 if _phase_is_24() else 0.0
+            # Default: Not detected (0) for 21; for 24 keep-row, missing cells should appear as non-PHAS cluster (1)
+            k = 1.0 if str(phase) == "24" else 0.0
             subSetData = tempRows[tempRows["alib"] == j]
             if not subSetData.empty:
                 if "non-PHAS" in subSetData["label"].values:
                     k = 1.0
                 elif "PHAS" in subSetData["label"].values:
                     k = 2.0
-            data.at[i, j] = k
+            data.loc[i, j] = k
 
     # Extract chromosome data from the identifier
-    chrom_data = [identifier.split(":")[0] for identifier in data.index]
+    chrom_data = [identifier.split(':')[0] for identifier in data.index]
 
-    # Sort chromosomes numerically instead of lexicographically (i.e., 1, 2, 3, ... not 1, 10, 2, 3, ...)
+    # Sort chromosomes numerically (1, 2, 3 ... not 1, 10, 2 ...)
     sorted_indices = sorted(
         range(len(chrom_data)),
-        key=lambda idx: int(chrom_data[idx]) if chrom_data[idx].isdigit() else chrom_data[idx],
+        key=lambda idx: int(chrom_data[idx]) if chrom_data[idx].isdigit() else chrom_data[idx]
     )
 
     # Reorder the DataFrame based on sorted chromosomes
@@ -219,61 +193,56 @@ def plot_report_heat_map(phasis_result_df, plot_type):
     chrom_data = [chrom_data[idx] for idx in sorted_indices]
     unique_chromosomes = sorted(np.unique(chrom_data), key=lambda x: int(x) if x.isdigit() else x)
 
-    # Create the heatmap figure with specified figure size
+    # Create the heatmap figure
     f, ax = plt.subplots(figsize=(11, 11))
 
-    # Define color map for the heatmap
+    # Define color map for the heatmap (exact original)
     colors = ["#C3D8EA", "#3662A5", "#C24F4E"]
     cmap = LinearSegmentedColormap.from_list("Custom", colors, len(colors))
 
-    # Create the actual heatmap for the PHAS data
+    # Create the actual heatmap
     heat = sns.heatmap(data, square=False, cmap=cmap, cbar=False, xticklabels=True, yticklabels=False, ax=ax)
 
-    # Add a new axis for the chromosome bar to the left
-    cax = f.add_axes([0.17, 0.1, 0.02, 0.8])  # Adjust the position for the left side
+    # Add a new axis for the chromosome bar to the left (exact original placement)
+    cax = f.add_axes([0.17, 0.1, 0.02, 0.8])
 
-    # Manually create a discrete grayscale colormap for the chromosomes
+    # Discrete grayscale colormap for chromosomes
     base_cmap = plt.get_cmap("Greys")
-    chrom_cmap = base_cmap(np.linspace(0.3, 0.9, len(unique_chromosomes)))  # Discretizing to avoid full black/white
-
-    # Assign colors based on the order of unique chromosomes
+    chrom_cmap = base_cmap(np.linspace(0.3, 0.9, len(unique_chromosomes)))
     chrom_color_map = {chrom: idx for idx, chrom in enumerate(unique_chromosomes)}
-
-    # Map chromosomes to grayscale colors
     chrom_colors = np.array([chrom_color_map[chrom] for chrom in chrom_data]).reshape(-1, 1)
 
-    # Plot the chromosome colorbar (no x-axis)
     cax.imshow(
         chrom_colors,
         cmap=LinearSegmentedColormap.from_list("CustomGreys", chrom_cmap, len(unique_chromosomes)),
-        aspect="auto",
+        aspect="auto"
     )
-    cax.set_xticks([])  # Remove x-axis ticks
-    cax.set_yticks([])  # Remove y-axis ticks
+    cax.set_xticks([])
+    cax.set_yticks([])
 
-    # Remove the black border around the colorbar
+    # Remove border
     cax.spines["top"].set_visible(False)
     cax.spines["right"].set_visible(False)
     cax.spines["bottom"].set_visible(False)
     cax.spines["left"].set_visible(False)
 
-    # Align chromosome bar with heatmap y-coordinates
-    cax.set_ylim(len(data.index), 0)  # Set y-limits to invert the chromosome bar
+    # IMPORTANT: for phase==24, do NOT force ylim; this avoids half-row offsets when few rows remain
+    if str(phase) != "24":
+        cax.set_ylim(len(data.index), 0)
 
-    # Calculate the midpoints for each chromosome based on its range of rows
+    # Midpoints for chromosome labels (exact original logic)
     chrom_ranges = {}
     for chrom in unique_chromosomes:
         chrom_loci_indices = np.where(np.array(chrom_data) == chrom)[0]
         chrom_midpoint = (chrom_loci_indices[0] + chrom_loci_indices[-1]) / 2
         chrom_ranges[chrom] = chrom_midpoint
 
-    # Set chromosome names in the middle of the chromosome color bar using calculated midpoints
     midpoints = [chrom_ranges[chrom] for chrom in unique_chromosomes]
     cax.set_yticks(midpoints)
     cax.set_yticklabels(unique_chromosomes, fontsize=16, rotation=0, ha="center")
     cax.yaxis.set_tick_params(labelsize=16, pad=11)
 
-    # Add a custom color bar (legend) to the top right
+    # Legend (exact original placement)
     cax2 = inset_axes(
         ax,
         width="2.5%",
@@ -281,7 +250,7 @@ def plot_report_heat_map(phasis_result_df, plot_type):
         loc="lower left",
         bbox_to_anchor=(-0.25, 1.01, 1, 1),
         bbox_transform=ax.transAxes,
-        borderpad=0,
+        borderpad=0
     )
     cax2.spines["top"].set_visible(False)
     cax2.spines["right"].set_visible(False)
@@ -290,67 +259,76 @@ def plot_report_heat_map(phasis_result_df, plot_type):
 
     cbar = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap), cax=cax2, orientation="vertical")
     cbar.set_ticklabels(["Not detected", r"non-$\it{PHAS}$ cluster", r"$\it{PHAS}$"])
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
 
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
     plt.subplots_adjust(left=0.2, right=0.9, top=0.9, bottom=0.1)
 
     fig = heat.get_figure()
-    out = _join_outdir(outdir, f"{phase}_{plot_type}_PHAS.pdf")
-    fig.savefig(out, dpi=300)
+    fig.savefig(_join_outdir(outdir, f"{phase}_{plot_type}_PHAS.pdf"), dpi=300)
     plt.close(fig)
-    return None
-
+    return
 
 def plot_phasAbundance_heat_map(phasis_result_df, plot_type):
-    print("#### Plotting PHAS Abundance heatmap ######")
+    print("#### Plotting phasAbundance heatmap ######")
 
-    all_libs = sorted(list(phasis_result_df["alib"].unique())) if (phasis_result_df is not None and not phasis_result_df.empty and "alib" in phasis_result_df.columns) else []
+    global outdir, phase
 
-    phasis_result_df = _filter_df_keep_any_phas_call(phasis_result_df)
+    # Keep full library columns (even if no PHAS in some libs)
+    all_libs = sorted(list(phasis_result_df["alib"].unique()))
+
+    # For phase==24: drop loci (rows) that have no PHAS call in any library
+    df = phasis_result_df
+    if str(phase) == "24":
+        ids_with_phas = set(df.loc[df["label"] == "PHAS", "identifier"].unique())
+        df = df[df["identifier"].isin(ids_with_phas)].copy()
+
+        if df.empty:
+            f, ax = plt.subplots(figsize=(6, 2))
+            ax.axis("off")
+            ax.text(0.01, 0.5, "No 24-PHAS loci detected.", fontsize=12)
+            f.savefig(_join_outdir(outdir, f"{plot_type}_{phase}_Abundance_PHAS.pdf"), dpi=300)
+            plt.close(f)
+            return None
 
     data = pd.DataFrame(
         data=0.0,
         columns=all_libs,
-        index=list(phasis_result_df["identifier"].unique()) if (phasis_result_df is not None and not phasis_result_df.empty and "identifier" in phasis_result_df.columns) else [],
+        index=list(df["identifier"].unique())
     )
 
-    if data.shape[0] == 0 or data.shape[1] == 0:
-        out = _join_outdir(outdir, f"{plot_type}_{phase}_Abundance_PHAS.pdf")
-        _save_empty_plot(out, f"{phase}-PHAS {plot_type}", "No loci to plot for this heatmap.")
-        return None
-
-    for i in _tqdm(data.index, desc="Processing Rows"):
-        tempRows = phasis_result_df[phasis_result_df["identifier"] == i]
+    it = tqdm(data.index, desc="Processing Rows") if tqdm else data.index
+    for i in it:
+        tempRows = df[df["identifier"] == i]
         for j in data.columns:
             k = 0.0
             subSetData = tempRows[tempRows["alib"] == j]
             if not subSetData.empty:
-                if "non-PHAS" in subSetData["label"].values:
-                    k = 0.0
-                elif "PHAS" in subSetData["label"].values:
+                if "PHAS" in subSetData["label"].values:
                     if "log_clust_len_norm_counts" in subSetData.columns and len(subSetData["log_clust_len_norm_counts"]) > 0:
                         k = float(subSetData["log_clust_len_norm_counts"].iloc[0])
-            data.at[i, j] = k
+            data.loc[i, j] = k
 
+    # Sort chromosomes numerically
     chrom_data = [identifier.split(":")[0] for identifier in data.index]
     sorted_indices = sorted(
         range(len(chrom_data)),
-        key=lambda idx: int(chrom_data[idx]) if chrom_data[idx].isdigit() else chrom_data[idx],
+        key=lambda idx: int(chrom_data[idx]) if chrom_data[idx].isdigit() else chrom_data[idx]
     )
     data = data.iloc[sorted_indices]
+
     chrom_data = [chrom_data[idx] for idx in sorted_indices]
     unique_chromosomes = sorted(np.unique(chrom_data), key=lambda x: int(x) if x.isdigit() else x)
 
-    max_value = float(data.max().max())
-    if max_value <= 0:
-        max_value = 1.0
+    max_value = data.max().max()
 
     f, ax = plt.subplots(figsize=(11, 11))
 
+    # Define custom colors (exact original)
     colors = ["#C3D8EA", "#3F2F13"]
     cmap = LinearSegmentedColormap.from_list("Custom", colors, 10)
     norm = Normalize(vmin=0, vmax=max_value)
 
+    # Colorbar axis (exact original placement)
     cax = inset_axes(
         ax,
         width="5%",
@@ -358,14 +336,15 @@ def plot_phasAbundance_heat_map(phasis_result_df, plot_type):
         loc="lower left",
         bbox_to_anchor=(-0.25, 1.01, 1, 1),
         bbox_transform=ax.transAxes,
-        borderpad=0,
+        borderpad=0
     )
     cbar = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=norm), cax=cax, orientation="vertical")
-    cbar.set_ticks([0, max_value / 3, 2 * max_value / 3, max_value])
-    cbar.set_ticklabels([f"{0:.1f}", f"{max_value / 3:.1f}", f"{2 * max_value / 3:.1f}", f"{max_value:.1f}"])
+    cbar.set_ticks([0, max_value/3, 2*max_value/3, max_value])
+    cbar.set_ticklabels([f"{0:.1f}", f"{max_value/3:.1f}", f"{2*max_value/3:.1f}", f"{max_value:.1f}"])
 
     heat = sns.heatmap(data, square=False, cmap=cmap, cbar=False, norm=norm, xticklabels=True, yticklabels=False, ax=ax)
 
+    # Chromosome bar
     cax2 = f.add_axes([0.17, 0.1, 0.02, 0.8])
 
     base_cmap = plt.get_cmap("Greys")
@@ -376,15 +355,19 @@ def plot_phasAbundance_heat_map(phasis_result_df, plot_type):
     cax2.imshow(
         chrom_colors,
         cmap=LinearSegmentedColormap.from_list("CustomGreys", chrom_cmap, len(unique_chromosomes)),
-        aspect="auto",
+        aspect="auto"
     )
     cax2.set_xticks([])
     cax2.set_yticks([])
+
     cax2.spines["top"].set_visible(False)
     cax2.spines["right"].set_visible(False)
     cax2.spines["bottom"].set_visible(False)
     cax2.spines["left"].set_visible(False)
-    cax2.set_ylim(len(data.index), 0)
+
+    # IMPORTANT: for phase==24, do NOT force ylim; this avoids half-row offsets when few rows remain
+    if str(phase) != "24":
+        cax2.set_ylim(len(data.index), 0)
 
     chrom_positions = np.array([np.mean(np.where(np.array(chrom_data) == chrom)) for chrom in unique_chromosomes])
     cax2.set_yticks(chrom_positions)
@@ -395,49 +378,58 @@ def plot_phasAbundance_heat_map(phasis_result_df, plot_type):
     plt.subplots_adjust(left=0.2, right=0.9, top=0.9, bottom=0.1)
 
     fig = heat.get_figure()
-    out = _join_outdir(outdir, f"{plot_type}_{phase}_Abundance_PHAS.pdf")
-    fig.savefig(out, dpi=300)
+    fig.savefig(_join_outdir(outdir, f"{plot_type}_{phase}_Abundance_PHAS.pdf"), dpi=300)
     plt.close(fig)
     return None
-
 
 def plot_totalAbundance_heat_map(phasis_result_df, plot_type):
     print("#### Plotting PHAS and non-PHAS Heatmaps ######")
 
-    all_libs = sorted(list(phasis_result_df["alib"].unique())) if (phasis_result_df is not None and not phasis_result_df.empty and "alib" in phasis_result_df.columns) else []
+    global outdir, phase
 
-    phasis_result_df = _filter_df_keep_any_phas_call(phasis_result_df)
+    # Keep full library columns
+    all_libs = sorted(list(phasis_result_df["alib"].unique()))
+
+    # For phase==24: drop loci (rows) that have no PHAS call in any library
+    df = phasis_result_df
+    if str(phase) == "24":
+        ids_with_phas = set(df.loc[df["label"] == "PHAS", "identifier"].unique())
+        df = df[df["identifier"].isin(ids_with_phas)].copy()
+
+        if df.empty:
+            f, ax = plt.subplots(figsize=(6, 2))
+            ax.axis("off")
+            ax.text(0.01, 0.5, "No 24-PHAS loci detected.", fontsize=12)
+            f.savefig(_join_outdir(outdir, f"{plot_type}_{phase}_Abundance_PHAS_and_nonPHAS.pdf"), dpi=300)
+            plt.close(f)
+            return None
 
     data_phas = pd.DataFrame(
         data=0.0,
         columns=all_libs,
-        index=list(phasis_result_df["identifier"].unique()) if (phasis_result_df is not None and not phasis_result_df.empty and "identifier" in phasis_result_df.columns) else [],
+        index=list(df["identifier"].unique())
     )
     data_non_phas = data_phas.copy()
 
-    if data_phas.shape[0] == 0 or data_phas.shape[1] == 0:
-        out = _join_outdir(outdir, f"{plot_type}_{phase}_Abundance_PHAS_and_nonPHAS.pdf")
-        _save_empty_plot(out, f"{phase}-PHAS {plot_type}", "No loci to plot for this heatmap.")
-        return None
-
-    for i in _tqdm(data_phas.index, desc="Processing Rows"):
-        tempRows = phasis_result_df[phasis_result_df["identifier"] == i]
+    it = tqdm(data_phas.index, desc="Processing Rows") if tqdm else data_phas.index
+    for i in it:
+        tempRows = df[df["identifier"] == i]
         for j in data_phas.columns:
             subSetData = tempRows[tempRows["alib"] == j]
             if not subSetData.empty and "total_abund" in subSetData.columns and len(subSetData["total_abund"]) > 0:
                 if "PHAS" in subSetData["label"].values:
-                    data_phas.at[i, j] = float(subSetData["total_abund"].iloc[0])
+                    data_phas.loc[i, j] = float(subSetData["total_abund"].iloc[0])
                 elif "non-PHAS" in subSetData["label"].values:
-                    data_non_phas.at[i, j] = float(subSetData["total_abund"].iloc[0])
+                    data_non_phas.loc[i, j] = float(subSetData["total_abund"].iloc[0])
 
-    # Apply log10 normalization
+    # Apply log10 normalization (exact original)
     data_phas = np.log10(data_phas.replace(0, np.nan).fillna(1e-10))
     data_non_phas = np.log10(data_non_phas.replace(0, np.nan).fillna(1e-10))
 
     chrom_data = [identifier.split(":")[0] for identifier in data_phas.index]
     sorted_indices = sorted(
         range(len(chrom_data)),
-        key=lambda idx: int(chrom_data[idx]) if chrom_data[idx].isdigit() else chrom_data[idx],
+        key=lambda idx: int(chrom_data[idx]) if chrom_data[idx].isdigit() else chrom_data[idx]
     )
     data_phas = data_phas.iloc[sorted_indices]
     data_non_phas = data_non_phas.iloc[sorted_indices]
@@ -445,12 +437,8 @@ def plot_totalAbundance_heat_map(phasis_result_df, plot_type):
     chrom_data = [chrom_data[idx] for idx in sorted_indices]
     unique_chromosomes = sorted(np.unique(chrom_data), key=lambda x: int(x) if x.isdigit() else x)
 
-    max_value_phas = float(data_phas.max().max())
-    max_value_non_phas = float(data_non_phas.max().max())
-    if max_value_phas <= 0:
-        max_value_phas = 1.0
-    if max_value_non_phas <= 0:
-        max_value_non_phas = 1.0
+    max_value_phas = data_phas.max().max()
+    max_value_non_phas = data_non_phas.max().max()
 
     f, ax = plt.subplots(figsize=(11, 11))
 
@@ -464,17 +452,7 @@ def plot_totalAbundance_heat_map(phasis_result_df, plot_type):
     sns.heatmap(data_phas, square=False, cmap=cmap_phas, cbar=False, norm=norm_phas, xticklabels=True, yticklabels=False, ax=ax)
 
     cmap_non_phas = LinearSegmentedColormap.from_list("non-PHAS", non_phas_colors, N=256)
-    sns.heatmap(
-        data_non_phas,
-        square=False,
-        cmap=cmap_non_phas,
-        cbar=False,
-        norm=norm_non_phas,
-        xticklabels=True,
-        yticklabels=False,
-        ax=ax,
-        alpha=0.5,
-    )
+    sns.heatmap(data_non_phas, square=False, cmap=cmap_non_phas, cbar=False, norm=norm_non_phas, xticklabels=True, yticklabels=False, ax=ax, alpha=0.5)
 
     cax_phas = inset_axes(
         ax,
@@ -483,11 +461,11 @@ def plot_totalAbundance_heat_map(phasis_result_df, plot_type):
         loc="lower left",
         bbox_to_anchor=(-0.25, 0.6, 1, 1),
         bbox_transform=ax.transAxes,
-        borderpad=0,
+        borderpad=0
     )
     cbar_phas = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap_phas, norm=norm_phas), cax=cax_phas, orientation="vertical")
-    cbar_phas.set_ticks([0, max_value_phas / 3, 2 * max_value_phas / 3, max_value_phas])
-    cbar_phas.set_ticklabels([f"{0:.1f}", f"{max_value_phas / 3:.1f}", f"{2 * max_value_phas / 3:.1f}", f"{max_value_phas:.1f}"])
+    cbar_phas.set_ticks([0, max_value_phas/3, 2*max_value_phas/3, max_value_phas])
+    cbar_phas.set_ticklabels([f"{0:.1f}", f"{max_value_phas/3:.1f}", f"{2*max_value_phas/3:.1f}", f"{max_value_phas:.1f}"])
     cbar_phas.set_label(r"log of $\it{PHAS}$ abundance", rotation=90, labelpad=15)
 
     cax_non_phas = inset_axes(
@@ -497,24 +475,21 @@ def plot_totalAbundance_heat_map(phasis_result_df, plot_type):
         loc="lower left",
         bbox_to_anchor=(-0.25, 0.0, 1, 1),
         bbox_transform=ax.transAxes,
-        borderpad=0,
+        borderpad=0
     )
     cbar_non_phas = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap_non_phas, norm=norm_non_phas), cax=cax_non_phas, orientation="vertical")
-    cbar_non_phas.set_ticks([0, max_value_non_phas / 3, 2 * max_value_non_phas / 3, max_value_non_phas])
-    cbar_non_phas.set_ticklabels([f"{0:.1f}", f"{max_value_non_phas / 3:.1f}", f"{2 * max_value_non_phas / 3:.1f}", f"{max_value_non_phas:.1f}"])
+    cbar_non_phas.set_ticks([0, max_value_non_phas/3, 2*max_value_non_phas/3, max_value_non_phas])
+    cbar_non_phas.set_ticklabels([f"{0:.1f}", f"{max_value_non_phas/3:.1f}", f"{2*max_value_non_phas/3:.1f}", f"{max_value_non_phas:.1f}"])
     cbar_non_phas.set_label(r"log of non-$\it{PHAS}$ abundance", rotation=90, labelpad=10)
 
+    # Chromosome bar (exact original, and this one was already correct)
     cax2 = f.add_axes([0.17, 0.1, 0.02, 0.8])
     base_cmap = plt.get_cmap("Greys")
     chrom_cmap = base_cmap(np.linspace(0.3, 0.9, len(unique_chromosomes)))
     chrom_color_map = {chrom: idx for idx, chrom in enumerate(unique_chromosomes)}
     chrom_colors = np.array([chrom_color_map[chrom] for chrom in chrom_data]).reshape(-1, 1)
 
-    cax2.imshow(
-        chrom_colors,
-        cmap=LinearSegmentedColormap.from_list("CustomGreys", chrom_cmap, len(unique_chromosomes)),
-        aspect="auto",
-    )
+    cax2.imshow(chrom_colors, cmap=LinearSegmentedColormap.from_list("CustomGreys", chrom_cmap, len(unique_chromosomes)), aspect="auto")
     cax2.set_xticks([])
     cax2.set_yticks([])
 
@@ -527,8 +502,7 @@ def plot_totalAbundance_heat_map(phasis_result_df, plot_type):
     plt.subplots_adjust(left=0.2, right=0.9, top=0.9, bottom=0.1)
 
     fig = ax.get_figure()
-    out = _join_outdir(outdir, f"{plot_type}_{phase}_Abundance_PHAS_and_nonPHAS.pdf")
-    fig.savefig(out, dpi=300)
+    fig.savefig(_join_outdir(outdir, f"{plot_type}_{phase}_Abundance_PHAS_and_nonPHAS.pdf"), dpi=300)
     plt.close(fig)
     return None
 

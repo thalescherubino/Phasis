@@ -1,0 +1,1037 @@
+"""Cluster scoring stage extracted from legacy.py (Phase I refactor).
+
+This module keeps the original scoring behavior while making the orchestration
+available as a stage function. It remains compatible with macOS spawn and Linux
+fork by pulling lightweight settings from phasis.runtime and by passing the
+scored chunk folder explicitly to worker tasks.
+"""
+
+import configparser
+import gc
+import os
+import pickle
+import re
+import sys
+from collections import Counter, defaultdict
+
+from scipy.stats import combine_pvalues, hypergeom, mannwhitneyu
+
+import phasis.runtime as rt
+from phasis.cache import (
+    MEM_FILE_DEFAULT,
+    assemble_candidate_from_chunks,
+    md5_file_worker,
+    sanitize_mem_md5s,
+)
+from phasis.parallel import run_parallel_with_progress
+
+# Match legacy advanced defaults
+UNIQRATIO_HIT = 2
+DOMSIZE_CUT = 0.50
+WINDOW_SIZE = 15
+
+# Stage-local mirrors of runtime values (refreshed by sync_from_runtime)
+mismat = None
+maxhits = None
+clustbuffer = None
+phase = None
+uniqueRatioCut = None
+memFile = None
+scoredClustFolder = None
+
+
+def sync_from_runtime() -> None:
+    """Refresh stage-local globals from phasis.runtime (spawn-safe with snapshot)."""
+    global mismat, maxhits, clustbuffer, phase, uniqueRatioCut, memFile
+
+    mismat = getattr(rt, "mismat", mismat)
+    maxhits = getattr(rt, "maxhits", maxhits)
+    clustbuffer = getattr(rt, "clustbuffer", clustbuffer)
+    phase = getattr(rt, "phase", phase)
+    uniqueRatioCut = getattr(rt, "uniqueRatioCut", uniqueRatioCut)
+
+    mem_override = getattr(rt, "memFile", None)
+    if mem_override:
+        memFile = mem_override
+    else:
+        outdir = getattr(rt, "outdir", None)
+        if outdir:
+            memFile = os.path.join(outdir, MEM_FILE_DEFAULT)
+        else:
+            memFile = MEM_FILE_DEFAULT
+
+
+def candidate_output_needs_rebuild(path: str) -> bool:
+    return (not os.path.isfile(path)) or (os.path.getsize(path) == 0)
+
+def resolve_lclust_path(path_like, clustfolder):
+    """
+    Resolve .lclust path to an existing ABS REALPATH.
+    Preference: given path → clustfolder/basename → CWD/basename fallback.
+    """
+    p = str(path_like)
+    if os.path.isfile(p):
+        return os.path.realpath(p)
+    b = os.path.basename(p)
+    cand = os.path.join(clustfolder, b) if clustfolder else None
+    if cand and os.path.isfile(cand):
+        return os.path.realpath(cand)
+    # last-ditch: interpret relative to CWD
+    cand2 = os.path.join(os.getcwd(), b)
+    if os.path.isfile(cand2):
+        return os.path.realpath(cand2)
+    # return normalized original (may not exist; caller will check)
+    return os.path.realpath(p)
+
+def updatedsets(config):
+    '''
+    checks which settings have been updated by comparing
+    globals from settings file with entries in memfile
+    '''
+
+    updatedsetL = []
+
+    if int(config["ADVANCED"]["mismat"])     != int(mismat):
+        updatedsetL.append("mismat")
+    if int(config["ADVANCED"]["maxhits"])    != int(maxhits):
+        updatedsetL.append("maxhits")
+    if int(config["ADVANCED"]["clustbuffer"])!= int(clustbuffer):
+        updatedsetL.append("clustbuffer")
+
+    ## Settings that may not exist in ealry phase of
+    ## analyses, generated error when this function
+    ## is used by early functions
+    if config['BASIC'].getboolean('phaselen'):
+        if int(config["BASIC"]["phaselen"])!= int(phase):
+            updatedsetL.append("phaselen")
+
+    return updatedsetL
+
+def _basename_no_ext(p):
+    # '/a/b/ALL_LIBS.fas' -> 'ALL_LIBS'
+    return os.path.basename(str(p)).rsplit('.', 1)[0]
+
+def canonicalize_akey(s: str) -> str:
+    """
+    Return 'LIB-CHR' from any akey-like string without destroying dots in LIB.
+    Handles paths and known suffixes (.lclust/.sclust).
+    """
+    base = os.path.basename(str(s)).strip()
+
+    # Only strip known file suffixes (do NOT rsplit('.') blindly)
+    for suf in (".lclust", ".sclust"):
+        if base.endswith(suf):
+            base = base[:-len(suf)]
+            break
+
+    # Prefer trailing "<lib>-<digits>" (chr) when present
+    m = re.search(r'([A-Za-z0-9._+-]+-\d+)$', base)
+    if m:
+        return m.group(1)
+
+    return base
+
+def build_libchrs_nestdict(sources, needed_keys=None):
+    """
+    Build {akey: value} from a mix of:
+      - dict objects (each mapping akey -> value), or
+      - '*.dict' pickle file paths containing such dicts.
+
+    If needed_keys is provided (set of akeys), only those keys are loaded.
+    """
+    result = {}
+    # Normalize input
+    if isinstance(sources, (dict, str)):
+        iterable = [sources]
+    else:
+        iterable = list(sources)
+
+    for idx, src in enumerate(iterable):
+        if isinstance(src, dict):
+            # Direct merge, but only required keys if specified
+            if needed_keys is None:
+                result.update(src)
+            else:
+                for k, v in src.items():
+                    if k in needed_keys:
+                        result[k] = v
+        elif isinstance(src, str):
+            # Load from pickle file path
+            try:
+                with open(src, "rb") as fh:
+                    loaded = pickle.load(fh)
+            except Exception as e:
+                print(f"[WARN] Could not load dict file '{src}': {e}")
+                continue
+            if not isinstance(loaded, dict):
+                print(f"[WARN] Dict file '{src}' did not contain a dict; got {type(loaded)}")
+                continue
+            if needed_keys is None:
+                result.update(loaded)
+            else:
+                # Only keep what we need
+                for k in needed_keys:
+                    if k in loaded:
+                        result[k] = loaded[k]
+            # free per-file object ASAP
+            del loaded
+            gc.collect()
+        else:
+            print(f"[WARN] Unexpected libs_nestdict element type at index {idx}: {type(src)}; skipping")
+
+    return result
+
+def iter_batches(seq, size):
+    for i in range(0, len(seq), size):
+        yield i // size + 1, (len(seq) + size - 1) // size, seq[i:i+size]
+
+def load_lclust_for_scoring(arg):
+    """
+    arg = (akey_expected, lclust_path)
+    Returns a tuple keyed by the file path (order-agnostic):
+        (lclust_path, loaded_akey, ldict)
+    - loaded_akey is derived from the filename stem, e.g. '<akey>.lclust' -> '<akey>'
+    - on failure: (lclust_path, None, None)
+    """
+    akey_expected, lclust_path = arg
+    try:
+        fname = os.path.basename(lclust_path)
+        loaded_akey = os.path.splitext(fname)[0]
+        with open(lclust_path, "rb") as fh:
+            ldict = pickle.load(fh)
+        return (lclust_path, loaded_akey, ldict)
+    except Exception as e:
+        print(f"[WARN] Could not load {lclust_path}: {e}")
+        return (lclust_path, None, None)
+
+def getPhasedIndexes(WINDOW_SIZE):
+    '''
+    generates phased indexes for position labelling
+    '''
+    ## generate phase position maps for
+    ## forward/reverse and for +/- strands
+    regs    = list(range(0, WINDOW_SIZE))   ## a template for positions coefficiants - OK
+    sens    = [i*int(phase) for i in regs]  ## forward direction to use with sRNAs on 'w' strand; for negative strand subtract - OK
+    ## add dicer offsets
+    dicer_off_left  = [x-1 for x in sens]
+    dicer_off_right = [x+1 for x in sens]
+    sens.extend(dicer_off_left)
+    sens.extend(dicer_off_right)
+    sens.sort()
+    asens   = [i-3 for i in sens]           ## forward direction to use with sRNAs on 'c' strand; for negative strand subtract - OK
+    return sens,asens
+
+def median(lst):
+    n = len(lst)
+    if n < 1:
+            return None
+    if n % 2 == 1:
+            return sorted(lst)[n//2]
+    else:
+            return sum(sorted(lst)[n//2-1:n//2+1])/2.0
+
+def compute_domsize(lenlist,abundict,abuncount):
+    '''
+    compute the dominant sRNA size in clusters
+    '''
+    ## combine len, counts and abundance in one
+    ## list for sorting on counts and abun
+    lencounter   = Counter(lenlist)
+    sizeinfo_l   = []
+    for alen,acount in lencounter.items():
+        aabun    = sum(abundict[alen])
+        sizeinfo_l.append((alen,acount,aabun))
+    sizeinfo_ls  = sorted(sizeinfo_l, key=lambda x: (-x[1],-x[2]))
+    ## dominant size class based on distribution of counts
+    if len(lencounter.keys()) <= 4:
+        ## just four size classes
+        DOMCOUNT_CUT = int(0.25*abuncount)
+    else:
+        DOMCOUNT_CUT = median(lencounter.values())
+    ## dominant size class based on counts - very stringent
+    domsize      = sizeinfo_ls[0][0] ## first element of list has most counts, store size
+    domcount     = sizeinfo_ls[0][1] ## first element of list has most counts, store count
+    domabun      = sizeinfo_ls[0][2] ## first element of list has most counts, store abun
+    samecounts_l = [x for x in sizeinfo_ls     if  x[1] == domcount]  ## get size classes that have same counts as domsize
+    domsize_l    = [x[0] for x in samecounts_l if  x[2] == domabun]   ## get size classes that have same abundance (alongwith counts) as domsize
+    return domsize_l,lencounter,DOMCOUNT_CUT
+
+def clustfilter(tempL1_s, tempL2_s, abundict, uniqcount, tagcount, abuncount):
+    """
+    filters a lib-chr list of cluster
+    Requires >= 10 tag entries in the cluster.
+    """
+    # Minimum evidence: at least 10 tag records in this cluster
+    if len(tempL1_s) < 10:
+        return False
+
+    # Basic sanity checks to avoid division by zero
+    if tagcount <= 0 or abuncount <= 0:
+        return False
+
+    ph = int(phase)
+
+    # Compute dominant size metrics
+    domsize_l, lencounter, DOMCOUNT_CUT = compute_domsize(tempL2_s, abundict, abuncount)
+
+    # Uniqueness ratio and phase-length abundance ratio
+    uniqratio = round(uniqcount / tagcount, 5)
+    ph_abuns = abundict.get(ph, [])
+    domsize_ratio = round((sum(ph_abuns) / abuncount), 5) if abuncount else 0.0
+
+    # Count of reads at the phase length
+    phaslen_counts = lencounter.get(ph, 0)
+
+    # Final decision
+    if (phaslen_counts > DOMCOUNT_CUT) and (uniqratio >= uniqueRatioCut) and (domsize_ratio >= DOMSIZE_CUT):
+        return True
+    else:
+        # the cluster size class doesn't match the phase or it has lots of multihit sRNAs
+        return False
+
+def mapPhaseSites(posinfo, poslist, direction, sens):
+    """
+    Label positions as phased ('p'), non-phased within window ('np'),
+    or outside window ('na') relative to a reference position/strand.
+
+    Notes:
+      - Uses set membership for speed.
+      - Ignores counts/abundances in poslist for labeling (only pos & strand).
+      - Expects `sens` = list of integer offsets (includes wobble if desired).
+      - Returns tuples: (apos, astrand, poscount, abun_all, abun_phase, label)
+    """
+    list_labeled = []
+    refpos, refstrand = posinfo[0], posinfo[1]
+
+    if direction == "F":
+        if refstrand == "w":
+            sens_p_set  = {refpos + o for o in sens}          # 'w' strand
+            asens_p_set = {refpos + o - 3 for o in sens}      # 'c' strand (−3 shift)
+            window_end  = max(sens_p_set)                     # 5'-most end
+            for bent in poslist:
+                bpos, bstrand = bent[0], bent[1]
+                if (bstrand == "w" and bpos in sens_p_set) or (bstrand == "c" and bpos in asens_p_set):
+                    label = "p"
+                elif bpos <= window_end:
+                    label = "np"
+                else:
+                    label = "na"
+                list_labeled.append((*bent, label))
+        else:  # refstrand == "c"
+            sens_p_set  = {refpos + o for o in sens}          # 'c' strand
+            asens_p_set = {refpos + o + 3 for o in sens}      # 'w' strand (+3 shift)
+            window_end  = max(asens_p_set)                    # 5'-most end
+            for bent in poslist:
+                bpos, bstrand = bent[0], bent[1]
+                if (bstrand == "w" and bpos in asens_p_set) or (bstrand == "c" and bpos in sens_p_set):
+                    label = "p"
+                elif bpos <= window_end:
+                    label = "np"
+                else:
+                    label = "na"
+                list_labeled.append((*bent, label))
+
+    elif direction == "R":
+        # Reverse direction (3' -> 5'): mirror offsets; order not needed for sets.
+        if refstrand == "w":
+            sens_p_set  = {refpos - o for o in sens}          # 'w' strand
+            asens_p_set = {p - 3 for p in sens_p_set}         # 'c' strand (−3 shift)
+            window_end  = min(asens_p_set)                    # 3'-most end
+            for bent in poslist:
+                bpos, bstrand = bent[0], bent[1]
+                if (bstrand == "w" and bpos in sens_p_set) or (bstrand == "c" and bpos in asens_p_set):
+                    label = "p"
+                elif bpos >= window_end:
+                    label = "np"
+                else:
+                    label = "na"
+                list_labeled.append((*bent, label))
+        else:  # refstrand == "c"
+            sens_p_set  = {refpos - o for o in sens}          # 'c' strand
+            asens_p_set = {p + 3 for p in sens_p_set}         # 'w' strand (+3 shift)
+            window_end  = min(sens_p_set)                     # 3'-most end
+            for bent in poslist:
+                bpos, bstrand = bent[0], bent[1]
+                if (bstrand == "w" and bpos in asens_p_set) or (bstrand == "c" and bpos in sens_p_set):
+                    label = "p"
+                elif bpos >= window_end:
+                    label = "np"
+                else:
+                    label = "na"
+                list_labeled.append((*bent, label))
+    else:
+        print(f"Unexpected input for scoring direction:{direction}")
+        print("PHASIS will exit now, please contact authors")
+        sys.exit()
+
+    return list_labeled
+
+def collectstats(labeled_list):
+    '''
+    takes a labelled list i.e. with 'p' and 'np'
+    tags for a cluster and specific to a reference position;
+    input list has follwing elements:
+    apos, astrand, poscount(number of sRNAs at one positions),
+    posabun_a_strand(abundance from all sRNAs),posabun_p_strand (abundance of sRNAs mathcing phase) and label (p and np)
+    '''
+    test_values_list = []
+    count_p  = len([i for i in labeled_list if i[-1] == "p"])
+    count_np = len([i for i in labeled_list if i[-1] == "np"])
+    count_all = count_p + count_np
+    test_values_list.extend((count_p, count_np, count_all))
+    ## WHAT STATS YOU NEED FOR RANK SUM?
+    ## Mann Whitney test requires two lists with values
+    ## Here we choose all abundances from non-phased and
+    ## all abundances from  phased positions; we could have
+    ## also selected the abundnaces from phased positions
+    ## correposnding to sRNAs that match phase length (since
+    ## it's already included in the input list) but anyhow
+    ## we are going to put a filter on the ratio of abundanced from
+    ## phased position for phase len against abundances from non-phased
+    ## postions.
+    abun_p_all   =  [int(i[3]) for i in labeled_list if i[-1] == "p"] ## selecting abundances for all sizes at phased psoitions
+    abun_np_all  =  [int(i[3]) for i in labeled_list if i[-1] == "np"] ## selecting abundances for all sizes from non-phased positions
+    abun_p_phase =  [int(i[4]) for i in labeled_list if i[-1] == "p"]
+    test_values_list.extend((abun_p_all,abun_np_all,abun_p_phase))
+    # ## compute phased sRNAs (of phaselen) vs. all ratio i.e.
+    # ## ph_size_prop using nesteddict fom clusterassemble
+    # pos_ph_size_prop = round(sum(abun_p_phase)/(sum(abun_p_all)+sum(abun_np_all)),5)
+    # test_values_list.extend(pos_ph_size_prop)
+    return test_values_list
+
+def hypertest(test_values_list):
+    '''
+    input: N,K,n,k
+    Computes probability from hypergeometric disribution
+    https://alexlenail.medium.com/understanding-and-implementing-the-hypergeometric-test-in-python-a7db688a7458
+    '''
+    M       = WINDOW_SIZE*int(phase)*2  ## count of all the positions from both strands in a window i.e. 'N'
+    n       = WINDOW_SIZE*2*3           ## count of expected phased position from both strands, including +1 and -1
+                                        ## dicer offsets in a window i.e 'K' i.e. max successes
+    N       = test_values_list[2]       ## count of all sRNAs filled positions (count_all) i.e. 'n'
+    X       = test_values_list[0]       ## count of positions labelled as phased(count_p) i.e. 'k' the observed successes
+    #print("Hyper pval variables - N:%s | K:%s | n:%s | k:%s" % (M,n,N,X))
+    #For the hypergeomtric test the count of all sRNA filled positions (N) cannot be higher
+    #than the possible number of positions from both strands in a window (M). It is biologically possible
+    #because many smallRNAs fragments can overlap, but doing so they are not occuping more positions that the should
+    #that why if N is bigger than N the value of N will be automatilly set to M
+    hyperp  = round(hypergeom.sf(X-1, M, n, N),10)
+    return hyperp,N,X
+
+def ranksumtest(test_values_list):
+    '''
+    computes probability from ranksum test
+    https://stats.stackexchange.com/questions/299733/how-to-interpret-wilcoxon-rank-sum-result
+    Mann-Whitney with tie and continuity correction is better option but can be applied only when
+    both populations have more than 20 postitiob-speciifc abundances
+    https://docs.scipy.org/doc/scipy-0.14.0/reference/generated/scipy.stats.mannwhitneyu.html#scipy.stats.mannwhitneyu
+    https://www.youtube.com/watch?v=BT1FKd1Qzjw&t=0s
+    Can' mix both tests for same cluster so Wilcoxon rank sum used
+    '''
+    abun_p_all  = test_values_list[3]
+    abun_np_all = test_values_list[4]
+    if not abun_p_all:
+        abun_p_all = [0]
+    if not abun_np_all:
+        abun_np_all =  [0]
+    ## Sanity check
+    aset = set(abun_p_all+abun_np_all)
+    if len(aset) == 1:
+        rankp           = 1.0 
+    else:
+        mannu_res       = mannwhitneyu(abun_p_all, abun_np_all, alternative='greater') ## testing if x ranks are greater then y ranks
+        rankp           = round(mannu_res[1],10)
+    return rankp
+
+def stouffer(pvals):
+    '''
+    combine pvals using stouffer's method
+    '''
+    apval = combine_pvalues(pvals, method='stouffer', weights=None)
+    return apval[1]
+
+def compute_p_vals(test_values_list_f,test_values_list_r):
+    '''
+    takes a list of values to compute p_values from forward and reverse direction
+    of a cluster
+    '''
+    ## apply statistical test - hyp and ranksum
+    ## to compute a pval for each position in cluster
+    ## do this in both forward and reverse direction,
+    ## for the latter used sens and asen in negative
+    pval_h_f,N_f,X_f     = hypertest(test_values_list_f)
+    pval_r_f             = ranksumtest(test_values_list_f)
+    pval_corr_f          = round(stouffer([pval_h_f,pval_r_f]),15)
+    pval_h_r,N_r,X_r     = hypertest(test_values_list_r)
+    pval_r_r             = ranksumtest(test_values_list_r)
+    pval_corr_r          = round(stouffer([pval_h_r,pval_r_r]),15)
+    return pval_h_f,N_f,X_f,pval_r_f,pval_corr_f,pval_h_r,N_r,X_r,pval_r_r,pval_corr_r
+
+def clustscore(aclust, poslist, sens, asens=None):
+    """
+    Scores an individual cluster and appends p-values.
+    `asens` kept for signature compatibility but not used.
+    """
+    scoredclust = []
+    cluster_pvals_f = []
+    cluster_pvals_r = []
+    pos_dict = {}
+
+    for ind in range(0, len(poslist)):
+        posinfo = poslist[ind]
+        flist   = poslist[ind:]     # forward slice
+        rlist   = poslist[:ind+1]   # reverse slice
+        apos    = posinfo[0]
+
+        # Fast labeling: set membership; no use of counts/abun for label
+        flist_labeled = mapPhaseSites(posinfo, flist, "F", sens)
+        rlist_labeled = mapPhaseSites(posinfo, rlist, "R", sens)
+
+        test_values_list_f = collectstats(flist_labeled)
+        test_values_list_r = collectstats(rlist_labeled)
+
+        pval_h_f, N_f, X_f, pval_r_f, pval_corr_f, pval_h_r, N_r, X_r, pval_r_r, pval_corr_r = \
+            compute_p_vals(test_values_list_f, test_values_list_r)
+
+        pos_dict[int(apos)] = (pval_h_f, N_f, X_f, pval_r_f, pval_corr_f,
+                               pval_h_r, N_r, X_r, pval_r_r, pval_corr_r)
+        cluster_pvals_f.append(pval_corr_f)
+        cluster_pvals_r.append(pval_corr_r)
+
+    for taginfo in aclust:
+        apos = int(taginfo[5])
+        astats = pos_dict[apos]
+        taginfo.extend(astats)
+        scoredclust.append(taginfo)
+
+    return scoredclust
+
+def clustwrite(akey, clustlist, scored_clust_folder=None):
+    '''
+    writes all clusters for a fragment
+    '''
+    #print("writting clusters")
+    target_folder = scored_clust_folder if scored_clust_folder else scoredClustFolder
+    outfile = "%s/%s.sRNA_%s.cluster" % (target_folder,akey,phase)
+    fh_out  = open(outfile,'a')
+    for aclust in clustlist:
+        #print(f"aclust is {aclust}")
+        aid,taglist = aclust
+        fh_out.write(">cluster = %s_%s_%s\n" % (akey,aid, taglist[0][0]))
+        for taginfo in taglist:
+            achr, astrand , ahits, atag, aname, apos, alen, abun, pval_h_f, N_f, X_f, pval_r_f, pval_corr_f, pval_h_r, N_r, X_r, pval_r_r,pval_corr_r = taginfo ## N and X stats are coming from hypergeometric test
+            fh_out.write("%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" % (achr,astrand,apos,alen,ahits,abun,pval_h_f,N_f,X_f,pval_r_f,pval_corr_f,pval_h_r,N_r,X_r,pval_r_r,pval_corr_r,aname,atag))
+    fh_out.close()
+    return None
+
+def clustassemble(aninput):
+    """
+    gather full info for clusters i.e. all tags for cluster positions
+    and write full clusters to a file
+    """
+    sync_from_runtime()
+    akey, lclustdict, nesteddict, sens, asens, scored_clust_folder = aninput
+    nesteddict = nesteddict[0]
+    clustlist  = []
+    phasedlist = []
+
+    for aid, aclust in lclustdict.items():
+        tempL1 = []   # full cluster tag records
+        tempL2 = []   # tag lengths
+        tempL3 = []   # (apos, strand, poscount, abun_all, abun_phase)
+
+        tagcount = 0
+        uniqcount = 0
+        abuncount = 0
+        abundict = defaultdict(list)
+
+        for apos in aclust:
+            tagslist = nesteddict[apos]
+            poscount_w = poscount_c = 0
+            posabun_a_w = posabun_p_w = 0
+            posabun_a_c = posabun_p_c = 0
+
+            for taginfo in tagslist:
+                taghits  = int(taginfo[2])
+                taglen   = int(taginfo[6])
+                tagabun  = int(taginfo[7])
+                tagstrand= taginfo[1]
+
+                tempL1.append(taginfo)
+                tempL2.append(taglen)
+
+                abuncount += tagabun
+                tagcount  += 1
+                uniqcount += 1 if taghits <= UNIQRATIO_HIT else 0
+                abundict[taglen].append(tagabun)
+
+                if tagstrand == "w":
+                    poscount_w  += 1
+                    posabun_a_w += tagabun
+                    posabun_p_w += tagabun if taglen == int(phase) else 0
+                elif tagstrand == "c":
+                    poscount_c  += 1
+                    posabun_a_c += tagabun
+                    posabun_p_c += tagabun if taglen == int(phase) else 0
+
+            if poscount_w > 0:
+                tempL3.append((apos, "w", poscount_w, posabun_a_w, posabun_p_w))
+            if poscount_c > 0:
+                tempL3.append((apos, "c", poscount_c, posabun_a_c, posabun_p_c))
+
+        tempL1_s = sorted(tempL1, key=lambda x: x[5])
+        tempL2_s = sorted(tempL2)
+        tempL3_s = sorted(tempL3, key=lambda x: x[0])
+
+        signal = clustfilter(tempL1_s, tempL2_s, abundict, uniqcount, tagcount, abuncount)
+        if signal:
+            # `asens` is accepted but not used by clustscore
+            scoredclust = clustscore(tempL1_s, tempL3_s, sens, asens)
+            clustlist.append((aid, scoredclust))
+
+    clustwrite(akey, clustlist, scored_clust_folder)
+    return None
+
+def scoringprocess(
+    libs,
+    libs_clustdicts,
+    libs_nestdict,
+    clustfolder,
+    force_rescore=False,
+    verify_outputs=True,
+    scored_dir=None,
+    purge_existing=False,
+    # Back-compat: discover concat from global if not given
+    concat_mode=None,
+    merged_name="ALL_LIBS",
+):
+    """
+    Cluster Scorer with concat-aware akey handling and robust mem/md5 bookkeeping.
+    Produces *.cluster chunks (in <phase>_scoredClusters) and assembles
+    <lib>.<phase>-PHAS.candidate.clusters outputs.
+
+    Returns: list[str] of assembled cluster file paths.
+    """
+    sync_from_runtime()
+    print("#### Fn: Cluster Scorer ######################")
+
+    # -------------------- Normalize inputs --------------------
+    # Expect a list like [(akey, lclust_path), ...]
+    libchrs_clust_toscore = []
+    for tpl in (libs_clustdicts or []):
+        if len(tpl) >= 2:
+            akey, lclust_path = tpl[0], tpl[1]
+            lclust_path = resolve_lclust_path(lclust_path, clustfolder)
+            libchrs_clust_toscore.append((akey, lclust_path))
+        else:
+            print(f"[WARN] Unexpected libs_clustdicts element (len={len(tpl)}): {tpl}")
+
+    if not libchrs_clust_toscore:
+        print("[WARN] No .lclust inputs to score; returning empty list.")
+        return []
+
+    # -------------------- mem file & sections --------------------
+    config = configparser.ConfigParser()
+    config.optionxform = str
+    config.read(memFile)
+    # NOTE: kept for legacy parity (currently return value is not used here).
+    _ = updatedsets(config)
+
+    sect_clusters = "CLUSTERS"       # outputs: bare filename -> md5
+    sect_lclust   = "CLUSTERED"      # inputs: absolute realpath -> md5
+    sect_chunks   = "SCORED_CHUNKS"  # chunk *.cluster absolute paths -> md5
+    for sect in (sect_clusters, sect_lclust, sect_chunks):
+        if not config.has_section(sect):
+            config.add_section(sect)
+
+    removed = sanitize_mem_md5s(config, (sect_clusters, sect_lclust, sect_chunks))
+    if any(removed.values()):
+        with open(memFile, "w") as fh:
+            config.write(fh)
+
+    # -------------------- Collect nest dict (unfiltered; robust in concat) ----
+    # Avoid losing entries by over-filtering here; we'll probe with canonical keys later.
+    libchrs_nestdict = build_libchrs_nestdict(libs_nestdict)
+
+    # -------------------- Filter: existing .lclust + available nest -----------
+    filtered_inputs, missing_akeys, missing_files = [], [], []
+    for akey, lclust_path in libchrs_clust_toscore:
+        if not os.path.isfile(lclust_path):
+            missing_files.append(lclust_path)
+            continue
+        if (akey in libchrs_nestdict) or (canonicalize_akey(akey) in libchrs_nestdict):
+            filtered_inputs.append((akey, lclust_path))
+        else:
+            missing_akeys.append(akey)
+
+    if missing_files:
+        print(f"[WARN] Missing .lclust files for {len(missing_files)}; e.g.: {missing_files[:3]}")
+    if missing_akeys:
+        print(f"[WARN] Missing nestdict for {len(missing_akeys)} akeys; skipped. Example: {missing_akeys[:5]}")
+
+    if not filtered_inputs:
+        print("[WARN] No valid inputs after filtering; returning empty list.")
+        return []
+
+    # -------------------- Concat mode detection/target lib --------------------
+    if concat_mode is None:
+        # Concat if we detect the merged lib name as a basename, or if only one lib provided
+        concat_mode = any(_basename_no_ext(alib) == merged_name for alib in (libs or [])) or (len(libs or []) == 1)
+
+    concat_target_lib = None
+    if concat_mode and libs:
+        # Prefer the lib whose basename matches merged_name, fall back to first
+        for alib in libs:
+            if _basename_no_ext(alib) == merged_name:
+                concat_target_lib = alib
+                break
+        if concat_target_lib is None:
+            concat_target_lib = libs[0]
+
+    # -------------------- Per-lib expected outfiles ---------------------------
+    expected_outfiles = []
+    if concat_mode and concat_target_lib:
+        bname = _basename_no_ext(concat_target_lib)
+        expected_outfiles.append((concat_target_lib, f"{bname}.{phase}-PHAS.candidate.clusters"))
+    else:
+        for alib in libs:
+            bname = _basename_no_ext(alib)
+            expected_outfiles.append((alib, f"{bname}.{phase}-PHAS.candidate.clusters"))
+
+    # -------------------- Map akey (basename) -> lib path ---------------------
+    akey_to_lib = {}
+    if concat_mode and concat_target_lib:
+        for akey, _ in filtered_inputs:
+            akey_to_lib[os.path.basename(str(akey))] = concat_target_lib
+    else:
+        # Greedy longest-prefix match against per-lib basename
+        lib_prefixes = [(_basename_no_ext(alib), alib) for alib in libs]
+        for akey, _ in filtered_inputs:
+            akey_base = os.path.basename(str(akey))
+            best_lib, best_len = None, -1
+            for pref, alib in lib_prefixes:
+                if akey_base.startswith(pref) or (pref in akey_base):
+                    if len(pref) > best_len:
+                        best_lib, best_len = alib, len(pref)
+            akey_to_lib[akey_base] = best_lib
+
+    # -------------------- Scored chunks folder (global for clustwrite) --------
+    currdir = os.getcwd()
+    base_scored = os.path.join(currdir, f"{phase}_scoredClusters")
+    os.makedirs(base_scored, exist_ok=True)
+
+    global scoredClustFolder
+    scoredClustFolder = scored_dir if scored_dir else base_scored
+
+    if purge_existing and os.path.isdir(scoredClustFolder):
+        # Purge only .cluster files; keep the folder
+        for fn in os.listdir(scoredClustFolder):
+            if fn.endswith(f".sRNA_{phase}.cluster"):
+                try:
+                    os.remove(os.path.join(scoredClustFolder, fn))
+                except Exception:
+                    pass
+
+    # -------------------- Batch planning -------------------------------------
+    n_data = len(filtered_inputs)
+    print(f"n_data is {n_data}")
+    batch_size = max(10, min(39, n_data))  # mirrors typical chunk sizes seen in logs
+    batches = list(iter_batches(filtered_inputs, batch_size))
+    print(f"n_batches set to {len(batches)}")
+
+    # Precompute phased indexes
+    sens, asens = getPhasedIndexes(WINDOW_SIZE)
+
+    # Track md5 updates + libs that need re-assembly
+    lclust_md5_updates = {}
+    libs_marked_stale = set()
+    if purge_existing or force_rescore:
+        libs_marked_stale.update(alib for (alib, _) in expected_outfiles)
+
+    # -------------------- Process batches ------------------------------------
+    for b_idx, b_tot, batch in batches:
+        print(f" Initial chunk_size set to {batch_size}")
+        # 1) Determine affected libs for this batch
+        batch_libs = set()
+        for akey, _ in batch:
+            alib = akey_to_lib.get(os.path.basename(str(akey)))
+            if alib is not None:
+                batch_libs.add(alib)
+
+        # Batch outfiles (concat: single; normal: those touched)
+        if concat_mode and concat_target_lib:
+            batch_outfiles = [(concat_target_lib, expected_outfiles[0][1])]
+        else:
+            filtered = [(alib, outf) for (alib, outf) in expected_outfiles if alib in batch_libs]
+            batch_outfiles = filtered or list(expected_outfiles)
+
+        # 2) Output MD5 check (bare filenames in [CLUSTERS])
+        batch_outputs_ok = False
+        outfile_md5_current = {}
+        outfile_realpaths = {}
+
+        if verify_outputs and not force_rescore and batch_outfiles:
+            existing_paths = []
+            for _, outf in batch_outfiles:
+                if os.path.isfile(outf):
+                    p = os.path.realpath(outf)
+                    outfile_realpaths[outf] = p
+                    existing_paths.append(p)
+
+            if existing_paths:
+                md5_results_out = run_parallel_with_progress(
+                    md5_file_worker,
+                    existing_paths,
+                    desc=f"Hashing existing outputs (batch {b_idx}/{b_tot})",
+                    min_chunk=1,
+                    unit="file",
+                )
+                for p_abs, md5 in md5_results_out:
+                    if md5:
+                        outfile_md5_current[p_abs] = md5
+
+                # Compare bare name keys in [CLUSTERS]
+                all_match = True
+                for _, outf in batch_outfiles:
+                    p_abs = outfile_realpaths.get(outf)
+                    if not p_abs:
+                        all_match = False
+                        break
+                    curr = outfile_md5_current.get(p_abs)
+                    prev = config[sect_clusters].get(os.path.basename(outf))
+                    if not curr or not prev or prev != curr:
+                        all_match = False
+                        break
+                batch_outputs_ok = all_match
+
+        # 3) Input MD5 check (absolute realpaths in [CLUSTERED])
+        batch_pairs = []
+        batch_paths = []
+        for akey, p in batch:
+            p_abs = os.path.realpath(p)
+            batch_pairs.append((akey, p_abs))
+            batch_paths.append(p_abs)
+
+        changed_inputs = set()
+        unknown_inputs = set()
+        batch_md5_map = {}
+        if not force_rescore:
+            md5_results_in = run_parallel_with_progress(
+                md5_file_worker,
+                batch_paths,
+                desc=f"Hashing .lclust (batch {b_idx}/{b_tot})",
+                min_chunk=1,
+                unit="file",
+            )
+            batch_md5_map = {p: md5 for (p, md5) in md5_results_in if md5 is not None}
+            for akey, p_abs in batch_pairs:
+                curr_in = batch_md5_map.get(p_abs)
+                if curr_in is None:
+                    changed_inputs.add(akey)
+                    unknown_inputs.add(p_abs)
+                    continue
+                prev_in = config[sect_lclust].get(p_abs)
+                if not prev_in or prev_in != curr_in:
+                    changed_inputs.add(akey)
+                else:
+                    lclust_md5_updates[p_abs] = curr_in  # unchanged; refresh md5
+
+        # If outputs are OK and there are no changed inputs, we can skip scoring
+        if batch_outputs_ok and not changed_inputs and not force_rescore:
+            print(f"[INFO] Batch {b_idx}/{b_tot}: outputs ok & inputs unchanged; skip scoring.")
+            # still refresh any unknown inputs
+            for p_abs in unknown_inputs:
+                md5_now = batch_md5_map.get(p_abs)
+                if md5_now:
+                    lclust_md5_updates[p_abs] = md5_now
+            continue
+
+        # 4) Load lclust dicts for the batch
+        to_process = [(akey, p_abs) for (akey, p_abs) in batch_pairs]
+        loaded = run_parallel_with_progress(
+            load_lclust_for_scoring,
+            to_process,
+            desc=f"Loading .lclust (batch {b_idx}/{b_tot}, {len(to_process)} akeys)",
+            min_chunk=1,
+            unit="lib-chr",
+        )
+
+        # Build lookup tables using canonical keys for robust matching
+        by_path = {}
+        by_akey = defaultdict(list)
+        for path_abs, loaded_akey, ldict in loaded:
+            loaded_akey_can = canonicalize_akey(loaded_akey)
+            by_path[path_abs] = (loaded_akey_can, ldict)
+            if loaded_akey_can is not None:
+                by_akey[loaded_akey_can].append((path_abs, ldict))
+
+        # 5) Build rawinputs for scoring (match loader/nest; handle mismatches)
+        rawinputs = []
+        mismatches = 0
+        missing_in_loader = 0
+        missing_nest = 0
+
+        for akey_exp, lclust_path in to_process:
+            akey_can = canonicalize_akey(akey_exp)
+            entry = by_path.get(lclust_path)
+
+            if entry is not None:
+                loaded_akey, ldict = entry
+                if ldict is None:
+                    continue
+                if loaded_akey != akey_can:
+                    cand = by_akey.get(akey_can, [])
+                    if len(cand) == 1:
+                        _, ldict2 = cand[0]
+                        ldict = ldict2
+                        mismatches += 1
+                    else:
+                        print(f"[WARN] Key mismatch ({akey_can} vs {loaded_akey}); skipping.")
+                        mismatches += 1
+                        continue
+            else:
+                cand = by_akey.get(akey_can, [])
+                if len(cand) == 1:
+                    _, ldict = cand[0]
+                    missing_in_loader += 1
+                else:
+                    print(f"[WARN] Loaded results missing path {lclust_path}")
+                    missing_in_loader += 1
+                    continue
+
+            # Probe the nest dict using expected key, then canonical
+            if akey_exp in libchrs_nestdict:
+                nest_key = akey_exp
+            elif akey_can in libchrs_nestdict:
+                nest_key = akey_can
+            else:
+                missing_nest += 1
+                continue
+
+            rawinputs.append((akey_can, ldict, libchrs_nestdict[nest_key], sens, asens, scoredClustFolder))
+
+        if mismatches or missing_in_loader or missing_nest:
+            print(
+                f"[INFO] Batch {b_idx}/{b_tot}: fixups={mismatches}, "
+                f"path_fallbacks={missing_in_loader}, missing_nest={missing_nest}"
+            )
+            # Any of these conditions means touched libs should be re-assembled
+            libs_marked_stale.update(batch_libs)
+
+        # 6) Score clusters -> *.cluster chunks
+        if rawinputs:
+            run_parallel_with_progress(
+                clustassemble,
+                rawinputs,
+                desc=f"Scoring clusters (batch {b_idx}/{b_tot})",
+                min_chunk=1,
+                unit="lib-chr",
+            )
+            libs_marked_stale.update(batch_libs)
+        else:
+            print(f"[INFO] Batch {b_idx}/{b_tot}: nothing to score after loader/nest checks.")
+
+        # 7) Refresh input MD5s for all batch paths
+        if batch_paths:
+            md5_results_in2 = run_parallel_with_progress(
+                md5_file_worker,
+                batch_paths,
+                desc=f"Refreshing .lclust hashes (batch {b_idx}/{b_tot})",
+                min_chunk=1,
+                unit="file",
+            )
+            for p_abs, md5 in md5_results_in2:
+                if md5 is not None:
+                    lclust_md5_updates[p_abs] = md5
+
+        # Free batch data
+        del loaded, by_path, by_akey, rawinputs
+        gc.collect()
+
+    # -------------------- Assemble per-lib outputs ----------------------------
+    clusterFiles = []
+    regenerated = []
+
+
+    if libs:
+        for alib, outfile in expected_outfiles:
+            lib_prefix = _basename_no_ext(alib)
+            must_rebuild = (
+                force_rescore or purge_existing or
+                (alib in libs_marked_stale) or
+                candidate_output_needs_rebuild(outfile)
+            )
+
+            if not must_rebuild:
+                clusterFiles.append(outfile)
+                continue
+
+            # Rebuild from chunks
+            if os.path.isfile(outfile):
+                try:
+                    os.remove(outfile)
+                except Exception:
+                    pass
+
+            n_chunks, n_bytes = assemble_candidate_from_chunks(
+                scoredClustFolder, lib_prefix, phase, outfile
+            )
+            if n_chunks > 0 and os.path.isfile(outfile) and os.path.getsize(outfile) > 0:
+                clusterFiles.append(outfile)
+                regenerated.append(outfile)
+                print(f"[OK] Aggregated {n_chunks} chunk(s) ({n_bytes} bytes) -> {outfile}")
+            else:
+                print(f"[WARN] No non-empty chunks aggregated for {lib_prefix}; {os.path.basename(outfile)} is empty.")
+                if os.path.isfile(outfile):
+                    clusterFiles.append(outfile)
+    else:
+        print("[WARN] No libraries passed for output assembly step.")
+
+    # -------------------- Hash regenerated outputs -> [CLUSTERS] --------------
+    if regenerated:
+        md5_after = run_parallel_with_progress(
+            md5_file_worker,
+            regenerated,
+            desc="Hashing regenerated outputs",
+            min_chunk=1,
+            unit="file",
+        )
+        for p_abs, md5 in md5_after:
+            if md5:
+                config[sect_clusters][os.path.basename(p_abs)] = md5
+
+    # -------------------- Hash chunk files -> [SCORED_CHUNKS] -----------------
+    if os.path.isdir(scoredClustFolder):
+        chunk_paths = [
+            os.path.realpath(os.path.join(scoredClustFolder, f))
+            for f in os.listdir(scoredClustFolder)
+            if f.endswith(f".sRNA_{phase}.cluster")
+        ]
+        if chunk_paths:
+            md5_chunks = run_parallel_with_progress(
+                md5_file_worker,
+                chunk_paths,
+                desc="Hashing .cluster chunks",
+                min_chunk=1,
+                unit="file",
+            )
+            for p_abs, md5 in md5_chunks:
+                if md5:
+                    config[sect_chunks][p_abs] = md5
+
+    # -------------------- Persist input md5 -> [CLUSTERED] --------------------
+    for p_abs, md5 in lclust_md5_updates.items():
+        if md5 is not None:
+            config[sect_lclust][p_abs] = md5
+
+    with open(memFile, "w") as fh:
+        config.write(fh)
+
+    print(f"cluster files are {clusterFiles}")
+    return clusterFiles
+
+__all__ = [
+    "scoringprocess",
+    "clustassemble",
+    "sync_from_runtime",
+]
