@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import configparser
 
 import numpy as np
@@ -22,11 +23,35 @@ WIN_SCORE_LOOKUP = st.WIN_SCORE_LOOKUP
 
 def fishers(pvals):
     """
-    Combine pvals using Fisher's method.
-    Returns the combined p-value.
+    Combine p-values using Fisher's method.
+
+    Notes
+    -----
+    SciPy's combine_pvalues computes log(p). If any p==0, you'll see
+    RuntimeWarning: divide by zero encountered in log. That is mathematically
+    fine (it implies an extremely significant combined p-value), but it is
+    noisy and can trigger numerical edge cases on some platforms.
+
+    We defensively clip p-values into (0, 1] before combining.
     """
-    apval = combine_pvalues(pvals, method="fisher", weights=None)
-    return apval[1]
+    if pvals is None:
+        return 1.0
+
+    arr = np.asarray(list(pvals), dtype=float)
+
+    # Drop NaNs/Infs
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 1.0
+
+    # Clip into (0, 1]; keep 1.0 as-is, push 0.0 up to a tiny positive float.
+    # 1e-300 is below typical double precision min-normal (~1e-308) but still
+    # representable; also avoids returning exactly 0.0 from combine_pvalues.
+    tiny = 1e-300
+    arr = np.clip(arr, tiny, 1.0)
+
+    stat, p = combine_pvalues(arr, method="fisher", weights=None)
+    return float(p)
 
 def compute_scores_for_group(chromosome_data_group):
     """
@@ -233,12 +258,20 @@ def compute_and_save_phasis_scores(clusters: pd.DataFrame) -> pd.DataFrame:
         )
 
     # --- Parallel compute ---
+    # On Linux/HPC, 'fork' can occasionally deadlock with NumPy/SciPy (esp. if any
+    # native libs have background threads). Prefer forkserver/spawn for this stage.
+    preferred_start = getattr(rt, "mp_start_method", None) or os.environ.get("PHASIS_MP_START_METHOD")
+    if preferred_start is None and sys.platform != "darwin":
+        preferred_start = "forkserver"
+
     results = run_parallel_with_progress(
         compute_scores_for_group,
         groups,
         desc="Scoring windows via Fisher's method",
         min_chunk=1,
         unit="lib-chr",
+        start_method=preferred_start,
+        kind="compute",
     )
 
     # Flatten and write

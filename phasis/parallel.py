@@ -9,8 +9,12 @@ def run_parallel_with_progress(
     batch_factor=0.1,
     unit="lib",
     on_result=None,        # Optional: callable(result) -> None (avoid storing results)
-    return_results=True    # If False and on_result provided, we won’t keep a results list
+    return_results=True,   # If False and on_result provided, we won’t keep a results list
+    start_method=None,     # Optional: 'spawn' / 'fork' / 'forkserver'
+    kind="compute",        # Passed to make_pool (e.g., 'plot' -> sets MPLBACKEND=Agg)
+    snapshot_path=None     # Optional explicit runtime snapshot path
 ):
+
     """
     Parallel, streaming, and adaptive:
       - Streams results via imap_unordered (low peak memory).
@@ -70,7 +74,7 @@ def run_parallel_with_progress(
                 for nw in worker_trials:
                     # Try streaming this chunk with nw workers
                     try:
-                        with make_pool(nw) as pool:
+                        with make_pool(nw, start_method=start_method, kind=kind, snapshot_path=snapshot_path) as pool:
                             # Stream results; avoid big intermediate lists
                             for res in pool.imap_unordered(safe_worker, ((func, arg) for arg in chunk), chunksize=1):
                                 if isinstance(res, RuntimeError):
@@ -256,7 +260,12 @@ def make_pool(nworkers: int | None = None, *, processes: int | None = None, star
     nworkers = int(max(1, nworkers or 1))
 
     if start_method is None:
-        start_method = "spawn" if sys.platform == "darwin" else "fork"
+        # Allow override from runtime/env. On Linux, prefer forkserver over fork to
+        # reduce deadlock risk with native libs that use threads (OpenMP/BLAS).
+        start_method = getattr(rt, "mp_start_method", None) or os.environ.get("PHASIS_MP_START_METHOD")
+        if start_method is None:
+            start_method = "spawn" if sys.platform == "darwin" else "forkserver"
+
 
     if snapshot_path is None:
         snapshot_path = _infer_runtime_snapshot_path()

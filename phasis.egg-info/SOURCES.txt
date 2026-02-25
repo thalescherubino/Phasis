@@ -26,7 +26,14 @@ phasis/stages/candidates_merge.py
 phasis/stages/classify.py
 phasis/stages/cluster_aggregation.py
 phasis/stages/cluster_build.py
+phasis/stages/cluster_scoring.py
+phasis/stages/dependency_check.py
 phasis/stages/feature_assembly.py
+phasis/stages/folder_setup.py
+phasis/stages/indexing.py
+phasis/stages/input_validation.py
+phasis/stages/library_processing.py
+phasis/stages/mapping.py
 phasis/stages/output.py
 phasis/stages/phas_clusters.py
 phasis/stages/phase1_pipeline.py

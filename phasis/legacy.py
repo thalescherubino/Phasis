@@ -67,6 +67,10 @@ from phasis.stages import cluster_build as st_cluster_build
 from phasis.stages import cluster_scoring as st_cluster_scoring
 from phasis.stages import mapping as st_mapping
 from phasis.stages import library_processing as st_library_processing
+from phasis.stages import indexing as st_indexing
+from phasis.stages import input_validation as st_input_validation
+from phasis.stages import dependency_check as st_dependency_check
+from phasis.stages import folder_setup as st_folder_setup
 
 memFile = MEM_FILE_DEFAULT
 
@@ -177,27 +181,11 @@ def sync_from_runtime() -> None:
     except Exception:
         pass
 
-
-
 def checkLibs():
-    '''
-    Read libs file
-    '''
-    ## Sanity check
-    notfound = []
-    for alibs in libs:
-        if fileexists(alibs) == False:
-            notfound.append(alibs)
-    if notfound:
-        print("\nERROR:These sRNA libraries not found   : %s" % (",".join(notfound)))
-        print("------Please check file exists at specified location")
-        sys.exit()
-
-    if fileexists(reference) == False:
-        print("\nERROR:Reference genome or transcriptome not found:%s" % (reference))
-        print("------Please check file exists at specified location")
-        sys.exit()
-    return libs
+    """
+    Thin wrapper to stage implementation (keeps legacy call sites stable).
+    """
+    return st_input_validation.checkLibs()
 
 ## ADVANCED SETTINGS ######################################
 UNIQRATIO_HIT   = 2             ## number of hits cutoff to consider sRNA as multihit for computing uniqness ratio of cluster
@@ -209,28 +197,10 @@ WINDOW_SIZE     = 15            ## Arbitrary window size;
 
 
 def checkDependency():
-    '''Checks for required components on user system'''
-    print("#### Fn: checkLibs ###########################")
-    goSignal  = True ### Signal to process is set to true
-    ### Check PYTHON version
-    major, minor = sys.version_info[:2]
-    if (major, minor) >= (3, 10):
-            print("--Python v3.10 or higher         : found")
-    else:
-        print("--Python v3.10 or higher         : missing")
-        goSignal = False
-    ### Check hisat
-    is_hisat = shutil.which("hisat2")
-    if is_hisat:
-        print("--Hisat (v2)                     : found")
-        pass
-    else:
-        print("--Hisat (v2)                     : missing")
-        goSignal    = False
-    if goSignal == False:
-        print("-------Please install the missing libraries and rerun analysis")
-        sys.exit()
-    return None
+    """
+    Thin wrapper to stage implementation (keeps legacy call sites stable).
+    """
+    return st_dependency_check.checkDependency()
 
 def fileexists(afile):
     '''
@@ -499,52 +469,17 @@ def isfiletagcount(afile):
     return abool
 
 def getindex(fh_run):
-    '''
-    this is higer level function, which checks if index needs
-    to be generated or reused, memory files are written in
-    this process
-    '''
-    ### check if index exists
-    if not os.path.isfile(memFile):
-        print("This is first run - create index")
-        indexflag = False       ## index will be made on fly
-    else:
-        memflag,index   = readMem(memFile)
-        if memflag  == False:
-            print("Memory file is empty - seems like previous run crashed")
-            print("Creating index")
-            indexflag = False   ## index will be made on fly
-        elif memflag  == True:
-            ## valid memory file detected - use existing index
-            currentRefHash = hashlib.md5(open('%s' % (reference),'rb').read()).hexdigest()
-            if currentRefHash == existRefHash:
-                indexIntegrity,indexExt = indexIntegrityCheck(index)
-                if indexIntegrity:          ### os.path.isdir(index.rpartition('/')[0]):
-                    print("Index status                     : Re-use")
-                    genoIndex   = index
-                    indexflag   = True
-                    fh_run.write("Indexing Time: 0s\n")
-                else:
-                    print("Index status                     : Re-make")
-                    indexflag   = False   ## index will be made on fly
-            else:
-                ## Different reference file - index will be remade
-                print("Index status                     : Re-make")
-                indexflag       = False
-                print("Existing index does not matches specified genome - It will be recreated")
-
-    if indexflag    == False:
-        ## index will be remade,
-        ## mem file will be initiated
-        tstart      = time.time()
-        genoIndex   = indexBuilder(reference,ncores)
-        tend        = time.time()
-        fh_run.write("Indexing Time:%ss\n" % (round(tend-tstart,2)))
-    else:
-        pass
-    print("Index to be used:%s" % (genoIndex))
-    return genoIndex
-
+    """
+    Thin wrapper to stage implementation (keeps legacy call sites stable).
+    """
+    return st_indexing.getindex(
+        fh_run,
+        readMem_fn=readMem,
+        read_mem_basic_fn=read_mem_basic,
+        indexIntegrityCheck_fn=indexIntegrityCheck,
+        indexBuilder_fn=indexBuilder,
+        compute_md5_str_fn=compute_md5_str,
+    )
 def indexIntegrityCheck(index):
     '''
     Checks the integrity of index and the extension
@@ -921,16 +856,10 @@ def cacheclustdicts(libchrs_keys,libchr_clustered,clustfolder):
     return libschrs_posdict_l,libschrs_nestdict_d
 
 def createfolders(currdir):
-    '''
-    create basic folders at the begining of process
-    '''
-    ## folder for storing cluster pickles
-    clustfolder = "%s/%s_clusters" % (currdir,phase)
-    if not os.path.isdir(clustfolder):
-        os.mkdir("%s" % (clustfolder))
-    else:
-        pass
-    return clustfolder
+    """
+    Thin wrapper to stage implementation (keeps legacy call sites stable).
+    """
+    return st_folder_setup.createfolders(currdir)
 
 def FASTAclean(ent):
     '''
