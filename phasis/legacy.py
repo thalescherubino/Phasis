@@ -7,6 +7,8 @@ version = 'v 2.5.3'
 ##                  License copy: Included and found at https://opensource.org/licenses/Artistic-2.0
 #### IMPORTS ##############################################
 import phasis.runtime as rt
+import phasis.cache as cache
+import phasis.libprep as libprep
 import os
 import sys
 import threading
@@ -79,27 +81,6 @@ outdir = None
 phase = None
 runtype = None
 
-def _sync_legacy_globals_from_runtime():
-    """
-    Mirror runtime (rt.*) into legacy module globals used all over legacy.py.
-    Keep it stdlib-only and side-effect free except for assignments.
-    """
-    global outdir, phase, runtype
-
-    # pull from runtime if present
-    if getattr(rt, "phase", None) is not None:
-        phase = rt.phase
-    if getattr(rt, "runtype", None):
-        runtype = rt.runtype
-
-    if getattr(rt, "outdir", None):
-        outdir = rt.outdir
-    else:
-        # last-resort default if runtime wasn't populated (shouldn't happen once CLI is fixed)
-        ph = phase if phase is not None else 21
-        outdir = f"{ph}_results"
-        rt.outdir = outdir  # keep runtime consistent
-
 # ---- legacy config is populated from phasis.runtime (spawn-safe) ----
 
 def sync_from_runtime() -> None:
@@ -120,6 +101,8 @@ def sync_from_runtime() -> None:
     maxhits = rt.maxhits
     runtype = rt.runtype
     mindepth = rt.mindepth
+    # Keep libprep helpers spawn-safe (workers import libprep fresh)
+    libprep.mindepth = mindepth
     uniqueRatioCut = rt.uniqueRatioCut
     max_complexity = rt.max_complexity
     mismat = rt.mismat
@@ -410,12 +393,18 @@ def indexBuilder(reference,ncores):
 
     ### Make a memory file ###################
     fh_out      = open(memFile,'w')
-    refHash     = (hashlib.md5(open('%s' % (reference),'rb').read()).hexdigest()) ### reference hash used instead of cleaned FASTA because while comparing only the user input reference is available
+    refHash = cache.compute_md5_str(reference)
+    if refHash is None:
+        refHash = "" ### reference hash used instead of cleaned FASTA because while comparing only the user input reference is available
     print("Generating MD5 hash for HiSat2 index")
     if os.path.isfile("%s.1.ht2l" % (genoIndex)):
-        indexHash   = (hashlib.md5(open('%s.1.ht2l' % (genoIndex),'rb').read()).hexdigest())
+        indexHash = cache.compute_md5_str(f"{genoIndex}.1.ht2l")
+        if indexHash is None:
+            indexHash = ""
     elif os.path.isfile("%s.1.ht2" % (genoIndex)):
-        indexHash   = (hashlib.md5(open('%s.1.ht2' % (genoIndex),'rb').read()).hexdigest())
+        indexHash = cache.compute_md5_str(f"{genoIndex}.1.ht2")
+        if indexHash is None:
+            indexHash = ""
     else:
         print("File extension for index couldn't be determined properly")
         print("It could be an issue from 'HiSat2'")
@@ -438,35 +427,9 @@ def indexBuilder(reference,ncores):
     print("Index prepared:%s\n" % (genoIndex))
     return genoIndex
 
-def isfasta(afile):
-    '''
-    test if file is fasta format
-    '''
-    fh_in       = open(afile,'r')
-    firstline   = fh_in.readline()
-    fh_in.close()
-    if not firstline.startswith('>') and len(firstline.split('\t')) > 1:
-        print("\nERROR: File '%s' doesn't seems to be a FASTA" % (afile))
-        print("------Please provide correct setting for 'libformat' in 'phasis.set'")
-        abool = False
-    else:
-        abool = True
-    return abool
 
-def isfiletagcount(afile):
-    '''
-    test if file is tab seprated tag and counts file
-    '''
-    fh_in       = open(afile,'r')
-    firstline   = fh_in.readline()
-    fh_in.close()
-    if firstline.startswith('>') or len(firstline.split('\t')) != 2 :
-        print("\nERROR: File '%s' doesn't seems to be tab-seprated tag-count format" % (afile))
-        print("------Please provide correct setting for 'libFormat' in 'phasis.set'")
-        abool = False
-    else:
-        abool = True
-    return abool
+
+
 
 def getindex(fh_run):
     """
@@ -533,104 +496,14 @@ def readMem(memFile):
 
     return bool(mem.ok), index
 
-def filter_process(alib):
-    '''
-    filter tag count file for mindepth, and write
-    to FASTA
-    '''
-    #print("Writing filtered FASTA for %s" % (alib))
-    asum = "%s.sum" % alib.rpartition('.')[0]    # Summary file
-    countFile   = "%s.fas" % alib.rpartition('.')[0]  ### Writing in de-duplicated FASTA format
-    fh_out      = open(countFile,'w')
-    fh_in       = open(alib,'r')
-    aread       = fh_in.readlines()
-    bcount      = 0 ## tags written
-    ccount      = 0 ## tags excluded
-    seqcount    = 1 ## To name seqeunces
-    for aline in aread:
-        atag,acount    = aline.strip("\n").split("\t")
-        if int(acount) >= int(mindepth):
-            fh_out.write(">seq_%s|%s\n%s\n" % (seqcount,acount,atag))
-            bcount      += 1
-            seqcount    += 1
-        else:
-            ccount+=1
-    #print("Library %s - tag written:%s | tags filtered:%s" % (alib,bcount,ccount))
-    with open(asum, 'a') as fh_sum:
-        fh_sum.write("Library %s - tag written:%s | tags filtered:%s\n" % (alib, bcount, ccount))
-    fh_in.close()
-    fh_out.close()
-    return countFile
 
-def dedup_process(alib):
-    '''
-    To parallelize the process
-    '''
-    print("#### Fn: De-duplicater #######################")
-    afastaL     = dedup_fastatolist(alib)         ## Read
-    acounter    = deduplicate(afastaL )           ## De-duplicate
-    fastafile   = dedup_writer(acounter,alib)     ## Write
-    return fastafile
 
-def dedup_fastatolist(alib):
-    '''
-    New FASTA reader
-    '''
-    ## Output
-    fastaL      = [] ## List that holds FASTA tags
-    ## input
-    fh_in       = open(alib,'r')
-    print("Reading FASTA file:%s" % (alib))
-    read_start  = time.time()
-    acount      = 0
-    empty_count = 0
-    for line in fh_in:
-        if line.startswith('>'):
-            seq = ''
-            pass
-        else:
-          seq = line.rstrip('\n')
-          fastaL.append(seq)
-          acount += 1
-    read_end    = time.time()
-    print("Cached file: %s | Tags: %s | Empty headers: %ss" % (alib,acount,empty_count))
-    fh_in.close()
-    return fastaL
 
-def deduplicate(afastaL):
-    '''
-    De-duplicates tags using multiple processes and libraries using multiple cores
-    '''
-    dedup_start = time.time()
-    acounter    = collections.Counter(afastaL)
-    dedup_end   = time.time()
-    return acounter
 
-def dedup_writer(acounter,alib):
-    '''
-    filter tag counts for 'mindepth' parameter, writes a dict
-    pickle and filtered fasta file
-    '''
-    print("Writing filtered FASTA for %s" % (alib))
-    sumFile = "%s.sum" % alib.rpartition('.')[0]    # Summary file
 
-    countFile   = "%s.fas" % alib.rpartition('.')[0]  ### Writing in de-duplicated FASTA format as required for phaster-core
-    fh_out      = open(countFile,'w')
-    wcount      = 0 ## tags written
-    bcount      = 0 ## tags excluded
-    seqcount    = 1 ## To name seqeunces
-    for atag,acount in acounter.items():
-        if int(acount) >= int(mindepth):
-            fh_out.write(">seq_%s|%s\n%s\n" % (seqcount,acount,atag))
-            wcount      += 1
-            seqcount    += 1
-        else:
-            bcount+=1
-    with open(sumFile, 'w') as fh_sum:
-        fh_sum.write("Library %s - tag written:%s | tags filtered:%s\n" % (alib, wcount, bcount))
-    #print("Library %s - tag written:%s | tags filtered:%s" % (alib,wcount,bcount))
-    fh_out.close()
-    return countFile
+
+
+
 
 def libstoset(alist,akey):
     '''
@@ -658,72 +531,6 @@ def libstoset(alist,akey):
     config.write(fh_out)
     fh_out.close()
     return None
-def fas_records(path):
-    """
-    Stream a .fas produced by your pipeline.
-    Header: >seq_<n>|<count>
-    Next line: <sequence>
-    Yields (sequence, count:int).
-    """
-    with open(path, 'r') as fh:
-        count_val = None
-        for line in fh:
-            if line.startswith('>'):
-                # Example: >seq_123|45
-                parts = line.split('|', 1)
-                if len(parts) < 2:
-                    raise ValueError(f"Malformed header in {path}: {line.strip()}")
-                try:
-                    count_val = int(parts[1].strip())
-                except Exception:
-                    raise ValueError(f"Non-integer count in {path}: {line.strip()}")
-            else:
-                seq = line.rstrip('\n')
-                if not seq:
-                    continue
-                if count_val is None:
-                    raise ValueError(f"Sequence without header in {path}")
-                yield (seq, count_val)
-                count_val = None
-
-def write_merged_fas(seq_counter, out_path, mindepth):
-    """
-    Write a merged .fas applying mindepth to merged totals.
-    Also writes a .sum sidecar like your per-lib writers.
-    """
-    wcount = 0
-    bcount = 0
-    seqnum = 1
-    with open(out_path, 'w') as out_fh:
-        for seq, total in seq_counter.items():
-            if int(total) >= int(mindepth):
-                out_fh.write(f">seq_{seqnum}|{total}\n{seq}\n")
-                wcount += 1
-                seqnum += 1
-            else:
-                bcount += 1
-    with open(f"{out_path.rpartition('.')[0]}.sum", 'w') as fh_sum:
-        fh_sum.write(
-            f"Merged library {os.path.basename(out_path)} - tags written:{wcount} | tags filtered:{bcount}\n"
-        )
-    return out_path
-
-def merge_processed_fastas(fas_paths, out_dir, out_basename, mindepth):
-    """
-    Merge multiple .fas by summing counts per identical sequence.
-    Returns the path to the merged .fas.
-    """
-    if not os.path.isdir(out_dir):
-        os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{out_basename}.fas")
-
-    counter = collections.Counter()
-    for p in fas_paths:
-        for seq, cnt in fas_records(p):
-            counter[seq] += cnt
-
-    write_merged_fas(counter, out_path, mindepth)
-    return out_path
 
 def libraryprocess(libs):
     """
@@ -733,11 +540,11 @@ def libraryprocess(libs):
         libs,
         run_parallel_with_progress_fn=run_parallel_with_progress,
         compute_md5_str_fn=compute_md5_str,
-        isfasta_fn=isfasta,
-        isfiletagcount_fn=isfiletagcount,
-        dedup_process_fn=dedup_process,
-        filter_process_fn=filter_process,
-        merge_processed_fastas_fn=merge_processed_fastas,
+        isfasta_fn=libprep.isfasta,
+        isfiletagcount_fn=libprep.isfiletagcount,
+        dedup_process_fn=libprep.dedup_process,
+        filter_process_fn=libprep.filter_process,
+        merge_processed_fastas_fn=libprep.merge_processed_fastas,
     )
 
 def mapprocess(libs, genoIndex):

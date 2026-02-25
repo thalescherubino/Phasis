@@ -9,6 +9,7 @@ phasis/deps_check.py
 phasis/from.hive.phasis.py
 phasis/ids.py
 phasis/legacy.py
+phasis/libprep.py
 phasis/parallel.py
 phasis/pipeline.py
 phasis/runtime.py

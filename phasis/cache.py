@@ -22,6 +22,7 @@ def phase2_basename(base_name:str)->str:
 
 EMPTY_MD5      = "d41d8cd98f00b204e9800998ecf8427e"
 _CHUNK_SIZE    = 8 * 1024 * 1024  # 8 MiB
+_FINGERPRINT_SAMPLE_BYTES = 64 * 1024  # 64 KiB per sample
 _MD5_RETRIES   = 3
 _MD5_BACKOFF_S = 0.2
 
@@ -50,85 +51,93 @@ def _wait_size_stable(path, checks=3, interval=0.2, timeout=5.0):
     # best effort: if it exists at all, proceed
     return os.path.isfile(path)
 
+def _fast_file_fingerprint(path: str) -> str | None:
+    """
+    Fast, content-based file fingerprint (no timestamps).
+
+    Returns a 32-hex-character string (blake2s digest_size=16) derived from:
+      - file size
+      - sampled bytes (beginning, middle, end) for large files; full read for small files
+
+    This is intentionally *not* cryptographic integrity like full-file MD5; it is a
+    fast cache key suitable for detecting likely changes in large files.
+    """
+    try:
+        st = os.stat(path)
+        size = int(st.st_size)
+
+        # Empty file keeps historical MD5 empty string for maximal backward compatibility.
+        if size == 0:
+            return EMPTY_MD5
+
+        h = hashlib.blake2s(digest_size=16)
+        # Mix stable metadata first to reduce collision probability for identical samples.
+        h.update(str(size).encode("utf-8"))
+        h.update(b"\0")
+
+        sample = _FINGERPRINT_SAMPLE_BYTES
+
+        def _read_at(fh, offset: int, n: int) -> bytes:
+            fh.seek(offset, os.SEEK_SET)
+            return fh.read(n)
+
+        with open(path, "rb") as f:
+            # Small files: hash entire content (still fast)
+            if size <= sample * 3:
+                h.update(f.read())
+                return h.hexdigest()
+
+            # Large files: sample beginning, middle, end
+            h.update(_read_at(f, 0, sample))
+
+            mid_off = max(0, (size // 2) - (sample // 2))
+            h.update(_read_at(f, mid_off, sample))
+
+            end_off = max(0, size - sample)
+            h.update(_read_at(f, end_off, sample))
+
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
 def getmd5(afile):
     """
-    Return (afile, md5hex_str). Robust against transient FS races.
-    Strategy:
-      - handle empty-file fast path,
-      - wait for size stability,
-      - try file_digest (3.11+),
-      - fallback to streaming read (8 MiB chunks),
-      - final fallback with smaller chunks.
+    Return (afile, hex_str) used as a cache key.
+
+    Historically this computed a full-file MD5, which is accurate but slow for large
+    files on network filesystems. We now compute a fast, content-based fingerprint
+    (blake2s over file size + sampled bytes) that is much faster and sufficiently
+    collision-resistant for cache invalidation.
     """
     p = afile
     try:
-        # Empty file fast path
-        try:
-            if os.path.getsize(p) == 0:
-                return (p, EMPTY_MD5)
-        except Exception:
-            # stat failed, keep going and let open() decide
-            pass
-
-        # Settle the file to avoid hashing during writes/flush on network FS
+        # Settle the file to avoid fingerprinting during writes/flush on network FS
         _wait_size_stable(p, checks=3, interval=0.2, timeout=5.0)
 
         for attempt in range(_MD5_RETRIES):
             try:
-                # 1) C-accelerated hash (Py 3.11+)
-                if hasattr(hashlib, "file_digest"):
-                    try:
-                        with open(p, "rb", buffering=0) as f:
-                            h = hashlib.file_digest(f, hashlib.md5())
-                            return (p, h.hexdigest())
-                    except Exception:
-                        # fall through to streaming
-                        pass
-
-                # 2) Streaming in large chunks
-                try:
-                    md5 = hashlib.md5()
-                    buf = bytearray(_CHUNK_SIZE)
-                    mv = memoryview(buf)
-                    with open(p, "rb", buffering=0) as f:
-                        while True:
-                            n = f.readinto(buf)
-                            if not n:
-                                break
-                            md5.update(mv[:n])
-                    return (p, md5.hexdigest())
-                except Exception:
-                    # 3) Final fallback: smaller chunks (1 MiB)
-                    md5 = hashlib.md5()
-                    small = 1024 * 1024
-                    with open(p, "rb", buffering=0) as f:
-                        while True:
-                            chunk = f.read(small)
-                            if not chunk:
-                                break
-                            md5.update(chunk)
-                    return (p, md5.hexdigest())
-
+                fp = _fast_file_fingerprint(p)
+                if fp is None:
+                    raise RuntimeError("fingerprint failed")
+                return (p, fp)
             except Exception:
                 time.sleep(_MD5_BACKOFF_S)
 
-        # Persistent failure: last resort – do NOT crash; return empty string
         return (p, "")
-
     except Exception:
         return (p, "")
+
 
 def compute_md5_str(path: str) -> str | None:
-    """Chunked md5 -> hex string (or None on failure)."""
-    try:
-        h = hashlib.md5()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return None
-    
+    """
+    Fast fingerprint -> hex string (or None on failure).
+
+    Kept for backward-compatibility with older call sites that expect a function
+    named compute_md5_str.
+    """
+    return _fast_file_fingerprint(path)
+
 def _md5_of_list_str(items):
     h = _md5()
     for s in items:
