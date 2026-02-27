@@ -2,7 +2,7 @@ import os
 import time
 
 from phasis import runtime as rt
-from phasis.cache import MEM_FILE_DEFAULT
+from phasis.cache import MEM_FILE_DEFAULT, read_mem_verbose
 
 
 # Stage-local globals (only what getindex needs)
@@ -44,8 +44,6 @@ def sync_from_runtime() -> None:
 def getindex(
     fh_run,
     *,
-    readMem_fn,
-    read_mem_basic_fn,
     indexIntegrityCheck_fn,
     indexBuilder_fn,
     compute_md5_str_fn,
@@ -53,7 +51,7 @@ def getindex(
     """
     Stage version of legacy.getindex(fh_run), preserving behavior/prints.
 
-    Uses injected legacy helpers to avoid moving low-level indexing/cache helpers yet.
+    Mem-file I/O now lives in cache.py; low-level index helpers remain injected.
     """
     global reference, memFile, ncores
 
@@ -64,23 +62,27 @@ def getindex(
         print("This is first run - create index")
         indexflag = False  # index will be made on fly
     else:
-        # Keep legacy memReader prints/signature behavior
-        memflag, index = readMem_fn(memFile)
+        memflag, index, mem = read_mem_verbose(memFile)
 
         if memflag is False:
             print("Memory file is empty - seems like previous run crashed")
             print("Creating index")
             indexflag = False  # index will be made on fly
-
-        elif memflag is True:
-            # Read parsed mem object to access genomehash without depending on legacy globals
-            mem = read_mem_basic_fn(memFile)
+        else:
             exist_ref_hash = str(mem.genomehash) if mem.genomehash is not None else ""
 
             # valid memory file detected - use existing index if hashes/integrity match
             current_ref_hash = compute_md5_str_fn(reference) or ""
 
-            if current_ref_hash == exist_ref_hash:
+            if current_ref_hash != exist_ref_hash:
+                print("Index status                     : Re-make")
+                indexflag = False
+                print("Existing index does not matches specified genome - It will be recreated")
+            elif not index:
+                print("Index status                     : Re-make")
+                indexflag = False
+                print("Existing index path missing from memory file - It will be recreated")
+            else:
                 indexIntegrity, indexExt = indexIntegrityCheck_fn(index)
                 _ = indexExt  # parity / debug value, not otherwise used here
 
@@ -92,14 +94,8 @@ def getindex(
                 else:
                     print("Index status                     : Re-make")
                     indexflag = False  # index will be made on fly
-            else:
-                # Different reference file - index will be remade
-                print("Index status                     : Re-make")
-                indexflag = False
-                print("Existing index does not matches specified genome - It will be recreated")
 
     if indexflag is False:
-        # index will be remade, mem file will be initiated by indexBuilder
         tstart = time.time()
         genoIndex = indexBuilder_fn(reference, ncores)
         tend = time.time()

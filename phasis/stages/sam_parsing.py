@@ -65,6 +65,26 @@ def updatedsets(config: configparser.ConfigParser) -> List[str]:
 
     return updated
 
+def _cached_file_matches(config: configparser.ConfigParser, section: str, path: str) -> bool:
+    """
+    Reuse cache only when:
+      - section exists
+      - key exists with a non-empty stored hash
+      - file exists on disk
+      - current hash matches stored hash
+    """
+    if not config.has_section(section):
+        return False
+
+    prev = (config[section].get(path) or "").strip()
+    if not prev:
+        return False
+
+    if not os.path.isfile(path):
+        return False
+
+    _, cur = getmd5(path)
+    return bool(cur and cur == prev)
 
 def libstoset(alist: Iterable[Tuple[str, str]], akey: str) -> None:
     """Write (path, md5) entries to the mem/settings file under section `akey`."""
@@ -113,26 +133,22 @@ def parserprocess(libs: Sequence[str], load_dicts: bool = False):
     if "mismat" in updatedsetL:
         print("Setting update detected for 'mismat' parameter")
         libs_to_parse = [f"{lib.rpartition('.')[0]}.sam" for lib in list(libs)]
-    elif config.has_section("PARSED"):
+    elif config.has_section("PARSED") or config.has_section("COUNTERS"):
         print("Subsequent run for parserprocess; parsing only remapped libraries")
-        parsekeys = list(config["PARSED"].keys())
         for alib in libs:
-            blib = "%s_%s.dict" % (alib.rpartition(".")[0], phase)
-            if blib in parsekeys:
-                xfiles = [k for k in parsekeys if k.rpartition(".")[0] == blib.rpartition(".")[0]]
-                if xfiles:
-                    _, bmd5 = getmd5(xfiles[0])
-                    if bmd5 == config["PARSED"][xfiles[0]]:
-                        print(f"MD5 matches for previously parsed library {alib.rpartition('.')[0]}")
-                        continue
-                    else:
-                        toAppend = f"{alib.rpartition('.')[0]}.sam"
-                        print(f"Added {toAppend} to libs_to_parse")
-                        libs_to_parse.append(toAppend)
-            else:
-                toAppend = f"{alib.rpartition('.')[0]}.sam"
-                print(f"Added {toAppend} to libs_to_parse")
-                libs_to_parse.append(toAppend)
+            dict_path = "%s_%s.dict" % (alib.rpartition(".")[0], phase)
+            count_path = "%s_%s.count" % (alib.rpartition(".")[0], phase)
+
+            dict_ok = _cached_file_matches(config, "PARSED", dict_path)
+            count_ok = _cached_file_matches(config, "COUNTERS", count_path)
+
+            if dict_ok and count_ok:
+                print(f"MD5 matches for previously parsed library {alib.rpartition('.')[0]}")
+                continue
+
+            toAppend = f"{alib.rpartition('.')[0]}.sam"
+            print(f"Added {toAppend} to libs_to_parse")
+            libs_to_parse.append(toAppend)
     else:
         libs_to_parse = [f"{lib.rpartition('.')[0]}.sam" for lib in list(libs)]
 

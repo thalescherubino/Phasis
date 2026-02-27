@@ -1,6 +1,7 @@
 from __future__ import annotations
 import phasis.runtime as rt
 import configparser
+import datetime
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -8,6 +9,7 @@ from hashlib import md5 as _md5
 import hashlib
 import os
 import time
+import re
 
 MEM_FILE_DEFAULT = "phasis.mem"
 
@@ -51,6 +53,12 @@ def _wait_size_stable(path, checks=3, interval=0.2, timeout=5.0):
     # best effort: if it exists at all, proceed
     return os.path.isfile(path)
 
+
+def _read_sample_at(fh, offset: int, n: int) -> bytes:
+    fh.seek(offset, os.SEEK_SET)
+    return fh.read(n)
+
+
 def _fast_file_fingerprint(path: str) -> str | None:
     """
     Fast, content-based file fingerprint (no timestamps).
@@ -66,35 +74,27 @@ def _fast_file_fingerprint(path: str) -> str | None:
         st = os.stat(path)
         size = int(st.st_size)
 
-        # Empty file keeps historical MD5 empty string for maximal backward compatibility.
         if size == 0:
             return EMPTY_MD5
 
         h = hashlib.blake2s(digest_size=16)
-        # Mix stable metadata first to reduce collision probability for identical samples.
         h.update(str(size).encode("utf-8"))
         h.update(b"\0")
 
         sample = _FINGERPRINT_SAMPLE_BYTES
 
-        def _read_at(fh, offset: int, n: int) -> bytes:
-            fh.seek(offset, os.SEEK_SET)
-            return fh.read(n)
-
         with open(path, "rb") as f:
-            # Small files: hash entire content (still fast)
             if size <= sample * 3:
                 h.update(f.read())
                 return h.hexdigest()
 
-            # Large files: sample beginning, middle, end
-            h.update(_read_at(f, 0, sample))
+            h.update(_read_sample_at(f, 0, sample))
 
             mid_off = max(0, (size // 2) - (sample // 2))
-            h.update(_read_at(f, mid_off, sample))
+            h.update(_read_sample_at(f, mid_off, sample))
 
             end_off = max(0, size - sample)
-            h.update(_read_at(f, end_off, sample))
+            h.update(_read_sample_at(f, end_off, sample))
 
         return h.hexdigest()
     except Exception:
@@ -105,14 +105,12 @@ def getmd5(afile):
     """
     Return (afile, hex_str) used as a cache key.
 
-    Historically this computed a full-file MD5, which is accurate but slow for large
-    files on network filesystems. We now compute a fast, content-based fingerprint
-    (blake2s over file size + sampled bytes) that is much faster and sufficiently
-    collision-resistant for cache invalidation.
+    Historically this computed a full-file MD5. We now compute a fast,
+    content-based fingerprint (BLAKE2s over file size + sampled bytes)
+    that is much faster and sufficiently collision-resistant for cache invalidation.
     """
     p = afile
     try:
-        # Settle the file to avoid fingerprinting during writes/flush on network FS
         _wait_size_stable(p, checks=3, interval=0.2, timeout=5.0)
 
         for attempt in range(_MD5_RETRIES):
@@ -137,6 +135,7 @@ def compute_md5_str(path: str) -> str | None:
     named compute_md5_str.
     """
     return _fast_file_fingerprint(path)
+
 
 def _md5_of_list_str(items):
     h = _md5()
@@ -253,17 +252,25 @@ def _run_signature_keyprefix():
     params_md5 = _md5_of_list_str([rt.mindepth, rt.maxhits, rt.clustbuffer])[:8]
     return f"ph-{_ph}_c-{_c}_L-{libs_md5}_P-{params_md5}"
 
-def _normalize_path_for_mem(path:str)->str:
+def _normalize_path_for_mem(path: str, base_dir: Optional[str] = None) -> str:
     # Compose a ConfigParser-safe key using only [A-Za-z0-9_.-]
-    import re as _re
     sig = _run_signature_keyprefix().replace('=', '-').replace('|', '_')
-    abspath = os.path.abspath(path)
-    from hashlib import md5 as _md5_local
-    pmd5 = _md5_local(abspath.encode('utf-8')).hexdigest()[:10]
+    p = (path or '').strip()
+    if not p:
+        return p
+    if p.startswith('~'):
+        abspath = p
+    else:
+        if base_dir is None:
+            base_dir = _mem_base_dir()
+        if not os.path.isabs(p):
+            p = os.path.join(base_dir, p)
+        abspath = os.path.abspath(p)
+    pmd5 = _md5(abspath.encode('utf-8')).hexdigest()[:10]
     base = os.path.basename(abspath)
-    base_sanitized = _re.sub(r'[^A-Za-z0-9_.-]', '_', base)
+    base_sanitized = re.sub(r'[^A-Za-z0-9_.-]', '_', base)
     key = f"{sig}__path-{pmd5}__base-{base_sanitized}"
-    key = _re.sub(r'[^A-Za-z0-9_.-]', '_', key)
+    key = re.sub(r'[^A-Za-z0-9_.-]', '_', key)
     return key
 
 def _mem_base_dir() -> str:
@@ -374,6 +381,73 @@ def read_mem_basic(mem_file: str) -> MemBasic:
     ok = bool(genomehash and indexhash and index)
     return MemBasic(ok=ok, index=index, genomehash=genomehash, indexhash=indexhash)
 
+
+def read_mem_verbose(mem_file: str) -> tuple[bool, str, MemBasic]:
+    """
+    Legacy-compatible mem reader with prints, but no legacy global writes.
+
+    Returns:
+        (memflag, index, mem)
+    """
+    print("#### Fn: memReader ############################")
+
+    mem = read_mem_basic(mem_file)
+
+    if mem.genomehash is not None:
+        print("Existing reference hash          :", str(mem.genomehash))
+
+    if mem.indexhash is not None:
+        print("Existing index hash              :", str(mem.indexhash))
+
+    if mem.index is not None:
+        print("Existing index location          :", str(mem.index))
+        index = str(mem.index)
+    else:
+        index = ""
+
+    return bool(mem.ok), index, mem
+
+
+def write_mem_basic(
+    mem_file: str,
+    *,
+    ref_hash: str,
+    index_path: str,
+    index_hash: str,
+    mindepth,
+    clustbuffer,
+    maxhits,
+    mismat,
+    timestamp: str | None = None,
+) -> None:
+    """
+    Canonical writer for the PHASIS mem file.
+    """
+    mem_dir = os.path.dirname(mem_file)
+    if mem_dir:
+        os.makedirs(mem_dir, exist_ok=True)
+
+    config = configparser.ConfigParser()
+    if timestamp is None:
+        timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M")
+
+    config["BASIC"] = {
+        "timestamp": timestamp,
+        "genomehash": "" if ref_hash is None else str(ref_hash),
+        "index": "" if index_path is None else str(index_path),
+        "indexhash": "" if index_hash is None else str(index_hash),
+    }
+    config["ADVANCED"] = {
+        "mindepth": "" if mindepth is None else str(mindepth),
+        "clustbuffer": "" if clustbuffer is None else str(clustbuffer),
+        "maxhits": "" if maxhits is None else str(maxhits),
+        "mismat": "" if mismat is None else str(mismat),
+    }
+
+    with open(mem_file, "w") as fh_out:
+        config.write(fh_out)
+
+
 __all__ = [
     "MEM_FILE_DEFAULT",
     "phase2_basename",
@@ -387,4 +461,6 @@ __all__ = [
     "mem_set",
     "MemBasic",
     "read_mem_basic",
+    "read_mem_verbose",
+    "write_mem_basic",
 ]

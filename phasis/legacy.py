@@ -2,13 +2,11 @@
 
 version = 'v 2.5.3'
 
-##                  Authors : Atul Kakrana,Thales H Cherubino Ribeiro, Blake C. Meyers
+##                  Authors : Thales H Cherubino Ribeiro, Atul Kakrana, Blake C. Meyers
 ##                  Affilations  : Meyers Lab (Donald Danforth Plant Science Center, St. Louis, MO)
 ##                  License copy: Included and found at https://opensource.org/licenses/Artistic-2.0
 #### IMPORTS ##############################################
 import phasis.runtime as rt
-import phasis.cache as cache
-import phasis.libprep as libprep
 import os
 import sys
 import threading
@@ -73,6 +71,10 @@ from phasis.stages import indexing as st_indexing
 from phasis.stages import input_validation as st_input_validation
 from phasis.stages import dependency_check as st_dependency_check
 from phasis.stages import folder_setup as st_folder_setup
+import phasis.cache as cache
+import phasis.index_integrity as index_integrity
+import phasis.libprep as libprep
+
 
 memFile = MEM_FILE_DEFAULT
 
@@ -101,7 +103,6 @@ def sync_from_runtime() -> None:
     maxhits = rt.maxhits
     runtype = rt.runtype
     mindepth = rt.mindepth
-    # Keep libprep helpers spawn-safe (workers import libprep fresh)
     libprep.mindepth = mindepth
     uniqueRatioCut = rt.uniqueRatioCut
     max_complexity = rt.max_complexity
@@ -392,38 +393,30 @@ def indexBuilder(reference,ncores):
         sys.exit()
 
     ### Make a memory file ###################
-    fh_out      = open(memFile,'w')
-    refHash = cache.compute_md5_str(reference)
-    if refHash is None:
-        refHash = "" ### reference hash used instead of cleaned FASTA because while comparing only the user input reference is available
     print("Generating MD5 hash for HiSat2 index")
-    if os.path.isfile("%s.1.ht2l" % (genoIndex)):
-        indexHash = cache.compute_md5_str(f"{genoIndex}.1.ht2l")
-        if indexHash is None:
-            indexHash = ""
-    elif os.path.isfile("%s.1.ht2" % (genoIndex)):
-        indexHash = cache.compute_md5_str(f"{genoIndex}.1.ht2")
-        if indexHash is None:
-            indexHash = ""
-    else:
+    try:
+        refHash, indexHash, _index_marker = index_integrity.compute_index_fingerprints(
+            reference=reference,
+            genoIndex=genoIndex,
+            compute_fingerprint_fn=cache.compute_md5_str,
+        )
+    except FileNotFoundError:
         print("File extension for index couldn't be determined properly")
         print("It could be an issue from 'HiSat2'")
         print("This needs to be reported to 'PHASIS' developer, report issue here\nhttps://github.com/atulkakrana/PHASIS/issues")
         print("Script will exit")
         sys.exit()
     ## write to memory file
-    ## follow format: https://docs.python.org/3.4/library/configparser.html
-    config = configparser.ConfigParser()
-    config['BASIC']     = {'timestamp'  : datetime.datetime.now().strftime("%m_%d_%H_%M"),
-                            'genomehash': refHash,
-                            'index'     : genoIndex,
-                            'indexhash' : indexHash}
-    config['ADVANCED']  = {'mindepth'       : mindepth,
-                            'clustbuffer'   : clustbuffer,
-                            'maxhits'       : maxhits,
-                            'mismat'        : mismat}
-    config.write(fh_out)
-    fh_out.close()
+    cache.write_mem_basic(
+        memFile,
+        ref_hash=refHash,
+        index_path=genoIndex,
+        index_hash=indexHash,
+        mindepth=mindepth,
+        clustbuffer=clustbuffer,
+        maxhits=maxhits,
+        mismat=mismat,
+    )
     print("Index prepared:%s\n" % (genoIndex))
     return genoIndex
 
@@ -437,72 +430,42 @@ def getindex(fh_run):
     """
     return st_indexing.getindex(
         fh_run,
-        readMem_fn=readMem,
-        read_mem_basic_fn=read_mem_basic,
-        indexIntegrityCheck_fn=indexIntegrityCheck,
+        indexIntegrityCheck_fn=index_integrity.indexIntegrityCheck,
         indexBuilder_fn=indexBuilder,
         compute_md5_str_fn=compute_md5_str,
     )
+
+
 def indexIntegrityCheck(index):
-    '''
-    Checks the integrity of index and the extension
-    '''
-    indexFolder     = index.rpartition("/")[0]
-    if os.path.isfile("%s.1.ht2l" % (index)): ## Check if this extension exists in folder
-        indexExt    = "ht2l"
-        indexFiles  = [i for i in os.listdir('%s' % (indexFolder)) if i.endswith('.ht2l')]
-        if len(indexFiles) >= 6:
-            indexIntegrity = True
-    elif os.path.isfile("%s.1.ht2" % (index)):
-        indexExt    = "ht2"
-        indexFiles  = [i for i in os.listdir('%s' % (indexFolder)) if i.endswith('.ht2')]
-        if len(indexFiles) >= 6:
-            indexIntegrity = True
-    else:
-        print("Existing index extension couldn't be determined")
-        print("Genome index will be remade")
-        indexExt        = False
-        indexIntegrity  = False
-    return indexIntegrity,indexExt
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.index_integrity.
+    """
+    return index_integrity.indexIntegrityCheck(index)
+
 
 def readMem(memFile):
     """
     Compatibility wrapper:
     - Keeps EXACT signature + return values (memflag, index)
     - Keeps legacy globals for the rest of legacy.py
-    - But cache.py stays pure (no legacy globals written there)
+    - cache.py owns the mem-file parsing/printing
     """
-    print("#### Fn: memReader ############################")
-
     global existRefHash, existIndexHash, index
 
-    mem = read_mem_basic(memFile)
+    memflag, index, mem = cache.read_mem_verbose(memFile)
 
-    # Mirror old behavior/prints
     if mem.genomehash is not None:
         existRefHash = str(mem.genomehash)
-        print("Existing reference hash          :", existRefHash)
 
     if mem.indexhash is not None:
         existIndexHash = str(mem.indexhash)
-        print("Existing index hash              :", existIndexHash)
 
     if mem.index is not None:
         index = str(mem.index)
-        print("Existing index location          :", index)
     else:
-        # ensure return value is defined even if missing
         index = ""
 
-    return bool(mem.ok), index
-
-
-
-
-
-
-
-
+    return bool(memflag), index
 
 
 def libstoset(alist,akey):
@@ -531,21 +494,11 @@ def libstoset(alist,akey):
     config.write(fh_out)
     fh_out.close()
     return None
-
 def libraryprocess(libs):
     """
     Thin wrapper to stage implementation (keeps legacy call sites stable).
     """
-    return st_library_processing.libraryprocess(
-        libs,
-        run_parallel_with_progress_fn=run_parallel_with_progress,
-        compute_md5_str_fn=compute_md5_str,
-        isfasta_fn=libprep.isfasta,
-        isfiletagcount_fn=libprep.isfiletagcount,
-        dedup_process_fn=libprep.dedup_process,
-        filter_process_fn=libprep.filter_process,
-        merge_processed_fastas_fn=libprep.merge_processed_fastas,
-    )
+    return st_library_processing.libraryprocess(libs)
 
 def mapprocess(libs, genoIndex):
     """

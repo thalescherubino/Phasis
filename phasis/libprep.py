@@ -1,10 +1,25 @@
 import os
 import time
 import collections
+import phasis.runtime as rt
 
 # Module-level default used by legacy-style call sites.
 # legacy.sync_from_runtime() will set this for spawn-safety.
 mindepth = None
+
+
+def _resolve_mindepth():
+    """Return the effective mindepth in both fork and spawn workers."""
+    if mindepth is not None:
+        return mindepth
+
+    rt_mindepth = getattr(rt, "mindepth", None)
+    if rt_mindepth is not None:
+        return rt_mindepth
+
+    raise RuntimeError(
+        "mindepth is not initialized in phasis.libprep; ensure the runtime snapshot is available to workers"
+    )
 
 def isfasta(afile):
     '''
@@ -41,6 +56,7 @@ def filter_process(alib):
     filter tag count file for mindepth, and write
     to FASTA
     '''
+    min_depth = int(_resolve_mindepth())
     #print("Writing filtered FASTA for %s" % (alib))
     asum = "%s.sum" % alib.rpartition('.')[0]    # Summary file
     countFile   = "%s.fas" % alib.rpartition('.')[0]  ### Writing in de-duplicated FASTA format
@@ -52,7 +68,7 @@ def filter_process(alib):
     seqcount    = 1 ## To name seqeunces
     for aline in aread:
         atag,acount    = aline.strip("\n").split("\t")
-        if int(acount) >= int(mindepth):
+        if int(acount) >= min_depth:
             fh_out.write(">seq_%s|%s\n%s\n" % (seqcount,acount,atag))
             bcount      += 1
             seqcount    += 1
@@ -114,6 +130,7 @@ def dedup_writer(acounter,alib):
     filter tag counts for 'mindepth' parameter, writes a dict
     pickle and filtered fasta file
     '''
+    min_depth = int(_resolve_mindepth())
     print("Writing filtered FASTA for %s" % (alib))
     sumFile = "%s.sum" % alib.rpartition('.')[0]    # Summary file
 
@@ -123,7 +140,7 @@ def dedup_writer(acounter,alib):
     bcount      = 0 ## tags excluded
     seqcount    = 1 ## To name seqeunces
     for atag,acount in acounter.items():
-        if int(acount) >= int(mindepth):
+        if int(acount) >= min_depth:
             fh_out.write(">seq_%s|%s\n%s\n" % (seqcount,acount,atag))
             wcount      += 1
             seqcount    += 1

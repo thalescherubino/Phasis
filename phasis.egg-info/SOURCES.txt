@@ -8,6 +8,7 @@ phasis/config.py
 phasis/deps_check.py
 phasis/from.hive.phasis.py
 phasis/ids.py
+phasis/index_integrity.py
 phasis/legacy.py
 phasis/libprep.py
 phasis/parallel.py
