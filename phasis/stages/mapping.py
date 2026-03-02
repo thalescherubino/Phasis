@@ -5,7 +5,8 @@ import sys
 import time
 
 from phasis import runtime as rt
-from phasis.cache import MEM_FILE_DEFAULT
+from phasis.cache import MEM_FILE_DEFAULT, getmd5
+from phasis.parallel import PPBalance, optimize, run_parallel_with_progress
 
 
 # Stage-local globals (populated by sync_from_runtime)
@@ -168,10 +169,6 @@ def mapprocess(
     genoIndex,
     *,
     ncores_local,
-    optimize_fn,
-    ppbalance_fn,
-    getmd5_fn,
-    run_parallel_with_progress_fn,
 ):
     """
     Map the libs to reference index and update settings.
@@ -209,15 +206,15 @@ def mapprocess(
     current_fas_md5 = {}
     for fas in fas_inputs:
         if os.path.isfile(fas):
-            _, md5 = getmd5_fn(fas)
+            _, md5 = getmd5(fas)
             current_fas_md5[fas] = md5 or ""
 
     # Existing SAM md5s
     computed_sam_md5 = {}
     sams_to_check = [s for s in sams_expected if os.path.isfile(s)]
     if sams_to_check:
-        md5_results = run_parallel_with_progress_fn(
-            getmd5_fn, sams_to_check, desc="Checking existing SAM hashes", unit="lib"
+        md5_results = run_parallel_with_progress(
+            getmd5, sams_to_check, desc="Checking existing SAM hashes", unit="lib"
         )
         for path, md5 in md5_results:
             computed_sam_md5[path] = md5 or ""
@@ -243,11 +240,10 @@ def mapprocess(
     if libs_to_map:
         print("Libraries to be mapped: %s" % (", ".join(libs_to_map)))
 
-        nproc, nspread = optimize_fn(ncores_local, len(libs_to_map))
-        _ = nproc  # preserve call parity / side effects; legacy uses globals, stage doesn't need nproc
+        nproc, nspread = optimize(ncores_local, len(libs_to_map))
 
         rawinputs = [(alib, genoIndex, nspread, maxhits, runtype) for alib in libs_to_map]
-        ppbalance_fn(mapper, rawinputs)
+        PPBalance(mapper, rawinputs, n_workers=nproc)
 
         libs_mapped = [f"{alib.rpartition('.')[0]}.sam" for alib in libs_to_map]
 
@@ -267,8 +263,8 @@ def mapprocess(
                 time.sleep(0.5)
                 tries += 1
 
-        sam_md5s = run_parallel_with_progress_fn(
-            getmd5_fn, libs_mapped, desc="Hashing mapped SAMs", unit="lib"
+        sam_md5s = run_parallel_with_progress(
+            getmd5, libs_mapped, desc="Hashing mapped SAMs", unit="lib"
         )
         for sam_path, md5 in sam_md5s:
             if md5:
@@ -277,7 +273,7 @@ def mapprocess(
                 print(f"[WARN] MD5 empty for {sam_path}; keeping blank (will force remap next run).")
 
         for fas in libs_to_map:
-            _, fas_md5 = getmd5_fn(fas)
+            _, fas_md5 = getmd5(fas)
             config["FASTAS"][fas] = fas_md5 or ""
 
         with open(memFile, "w") as fh:
@@ -293,7 +289,7 @@ def mapprocess(
                 continue
             mem_md5 = (config["MAPS"].get(sam_path) or "").strip()
             if not mem_md5:
-                _, cur_md5 = getmd5_fn(sam_path)
+                _, cur_md5 = getmd5(sam_path)
                 if cur_md5:
                     config["MAPS"][sam_path] = cur_md5
                     wrote_any = True

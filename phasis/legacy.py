@@ -510,10 +510,6 @@ def mapprocess(libs, genoIndex):
         libs,
         genoIndex,
         ncores_local=ncores,
-        optimize_fn=optimize,
-        ppbalance_fn=PPBalance,
-        getmd5_fn=getmd5,
-        run_parallel_with_progress_fn=run_parallel_with_progress,
     )
 
     return libs_mapped
@@ -658,88 +654,6 @@ def coreReserve(cores):
         else: ncores = int(cores*0.95)
 
     return ncores
-
-def optimize(ncores,nfiles):
-    '''
-    optimization of total processes and cores per process
-    '''
-    nspread     = int(ncores/nfiles) ### Number of parallel cores per process
-    if nspread  < 3:
-        ## enforce minimum nspread value
-        ## and compute possible processes
-        nspread = 3
-        nproc   = int(ncores/3)
-    else:
-        ## nspread estimate is healthy
-        ## compute possible processed
-        nproc   = nfiles
-    print("\n#### %s computing core(s) reserved for analysis" % (str(ncores)))
-    print("#### %s computing core(s) assigned to each lib #\n" % (str(nspread)))
-    return nproc,nspread
-
-'''def PPBalance(module, alist):
-    print("##    FN PPBalance   ######")
-    n_workers = int(globals().get('nproc', 1))
-    if n_workers < 1:
-        n_workers = 1
-    # Linux default context; no need to specify
-    pool = multiprocessing.Pool(n_workers)
-    errors = []
-    try:
-        results = []
-        for i, res in enumerate(pool.imap_unordered(module, alist), 1):
-            results.append(res)
-        pool.close()
-        pool.join()
-        return results
-    except Exception as e:
-        print(f"[PPBalance] Error in parallel processing: {e}")
-        traceback.print_exc()
-        pool.terminate()
-        pool.join()
-        errors.append(e)
-        raise
-    finally:
-        try:
-            pool.terminate()
-            pool.join()
-        except Exception:
-            pass
-    if errors:
-        print("[PPBalance] Some jobs failed, see logs above.")
-'''
-
-def PPBalance(module, alist):
-    print("##    FN PPBalance   ######")
-    n_workers = int(globals().get('nproc', 1))
-    if n_workers < 1:
-        n_workers = 1
-    # Linux default context; no need to specify
-    pool = multiprocessing.Pool(n_workers)
-    errors = []
-    try:
-        results = []
-        for i, res in enumerate(pool.imap_unordered(module, alist), 1):
-            results.append(res)
-        pool.close()
-        pool.join()
-        return results
-    except Exception as e:
-        print(f"[PPBalance] Error in parallel processing: {e}")
-        traceback.print_exc()
-        pool.terminate()
-        pool.join()
-        errors.append(e)
-        raise
-    finally:
-        try:
-            pool.terminate()
-            pool.join()
-        except Exception:
-            pass
-    if errors:
-        print("[PPBalance] Some jobs failed, see logs above.")
-
 
 def PPResults(module,alist):
     '''
@@ -1851,39 +1765,12 @@ def scoringprocess(
     )
 
 def legacy_entrypoint():
-    global ncores, libs
+    """
+    Compatibility wrapper: top-level dispatch now lives in phasis.pipeline.
+    """
+    from phasis.pipeline import run_pipeline
 
-    sync_from_runtime()
-
-    # legacy startup sequence (same order as before)
-    ncores = coreReserve(cores)
-
-    # Step-2 bridge (parallel.py will read rt.ncores)
-    rt.ncores = ncores
-
-    checkDependency()
-    libs_checked = checkLibs()
-
-    # keep legacy + runtime consistent
-    libs = libs_checked
-    rt.libs = libs_checked
-
-    # ---- dispatcher (replaces legacy main()) ----
-    steps_local = getattr(rt, "steps", None) or globals().get("steps", "both")
-    steps_local = str(steps_local).strip().lower()
-
-    if steps_local == "cfind":
-        run_phase1(libs_checked)
-    elif steps_local == "class":
-        # run_phase2() will pull cfg from runtime and override clusterFilePaths
-        run_phase2([])
-    elif steps_local == "both":
-        clusterFilePaths = run_phase1(libs_checked)
-        run_phase2(clusterFilePaths)
-    else:
-        raise ValueError(
-            f"Unknown steps value: {steps_local!r} (expected 'cfind', 'class', or 'both')"
-        )
+    return run_pipeline()
 
 
 if __name__ == "__main__":

@@ -295,3 +295,61 @@ def safe_worker(args):
         return RuntimeError(f"Error in {func.__name__} with arg={arg}: {e}\n{traceback.format_exc()}")
 
 
+
+
+def optimize(ncores: int, nfiles: int):
+    '''
+    Optimization of total processes and cores per process.
+
+    Returns:
+      (nproc, nspread)
+    '''
+    if nfiles <= 0:
+        return 1, max(1, int(ncores) if ncores else 1)
+
+    ncores = int(ncores) if ncores else 1
+    nspread = int(ncores / nfiles)  # cores per process
+    if nspread < 3:
+        nspread = 3
+        nproc = int(ncores / 3) if ncores >= 3 else 1
+    else:
+        nproc = nfiles
+
+    if nproc < 1:
+        nproc = 1
+
+    print(f"\n#### {ncores} computing core(s) reserved for analysis")
+    print(f"#### {nspread} computing core(s) assigned to each lib #\n")
+    return nproc, nspread
+
+
+def PPBalance(module, alist, *, n_workers: int | None = None, start_method: str | None = None, kind: str = "compute"):
+    '''
+    Parallel runner used by legacy mapping: run `module(arg)` for each arg in alist.
+
+    - Uses the safer `make_pool()` defaults (spawn on macOS, forkserver on Linux).
+    - Returns a list of results (usually ignored by callers).
+    - Raises on pool-level exceptions.
+    - If an item fails, returns a RuntimeError sentinel for that item (via safe_worker).
+    '''
+    print("##    FN PPBalance   ######")
+
+    if n_workers is None:
+        # default: use rt.ncores when available, else 1
+        try:
+            n_workers = int(getattr(rt, "ncores", 1) or 1)
+        except Exception:
+            n_workers = 1
+
+    n_workers = int(max(1, n_workers))
+
+    results = []
+    try:
+        with make_pool(n_workers, start_method=start_method, kind=kind) as pool:
+            for res in pool.imap_unordered(safe_worker, ((module, arg) for arg in alist), chunksize=1):
+                results.append(res)
+        return results
+    except Exception as e:
+        print(f"[PPBalance] Error in parallel processing: {e}")
+        traceback.print_exc()
+        raise
