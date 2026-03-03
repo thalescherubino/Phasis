@@ -8,10 +8,48 @@ from typing import Dict, Iterable, Optional, Tuple
 from hashlib import md5 as _md5
 import hashlib
 import os
+import shutil
 import time
 import re
 
 MEM_FILE_DEFAULT = "phasis.mem"
+
+
+CLEANUP_PATTERNS = [
+    'fas', 'sam', 'dict', 'count', 'runtime', 'sum', 'count',
+    'scoredClusters', 'candidate.clusters', 'clusters',
+]
+
+
+def match_pattern(filename, patterns):
+    for pattern in patterns:
+        if filename.endswith(pattern):
+            return True
+    return False
+
+
+def cleanup(base_dir: str | None = None, patterns=None) -> None:
+    """
+    Delete PHASIS intermediate files/directories under the run directory.
+
+    Kept as a canonical helper outside legacy.py so the active pipeline can
+    support -cleanup without routing cleanup logic through legacy.
+    """
+    cleanup_patterns = list(patterns or CLEANUP_PATTERNS)
+    target_dir = base_dir or getattr(rt, 'run_dir', None) or os.getcwd()
+    target_dir = os.path.abspath(os.path.expanduser(target_dir))
+
+    for root, dirs, files in os.walk(target_dir, topdown=True):
+        for dirname in list(dirs):
+            if match_pattern(dirname, cleanup_patterns):
+                path = os.path.join(root, dirname)
+                shutil.rmtree(path)
+                dirs.remove(dirname)
+
+        for filename in files:
+            if match_pattern(filename, cleanup_patterns):
+                path = os.path.join(root, filename)
+                os.remove(path)
 
 
 def phase2_basename(base_name:str)->str:
@@ -450,6 +488,9 @@ def write_mem_basic(
 
 __all__ = [
     "MEM_FILE_DEFAULT",
+    "CLEANUP_PATTERNS",
+    "match_pattern",
+    "cleanup",
     "phase2_basename",
     "getmd5",
     "compute_md5_str",

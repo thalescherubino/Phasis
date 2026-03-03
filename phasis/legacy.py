@@ -45,7 +45,7 @@ from matplotlib.patches import Rectangle
 import csv
 import traceback
 from typing import List, Sequence, Dict, Tuple, Any
-from phasis.parallel import run_parallel_with_progress, make_pool, safe_worker, _compute_initial_chunk_size
+from phasis.parallel import run_parallel_with_progress, make_pool, safe_worker, _compute_initial_chunk_size, coreReserve as parallel_coreReserve
 from .cache import *   # re-export cache public API
 from .cache import __all__  # make "import *" stable
 from .cache import MEM_FILE_DEFAULT
@@ -200,21 +200,17 @@ def fileexists(afile):
     return abool
 
 def match_pattern(filename, patterns):
-    for pattern in patterns:
-        if filename.endswith(pattern):
-            return True
-    return False
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.cache.
+    """
+    return cache.match_pattern(filename, patterns)
 
 def cleanup():
-    cleanup_patterns = ['fas', 'sam', 'dict', 'count', 'runtime', 'sum', 'count', 'scoredClusters', 'candidate.clusters', 'clusters']
-    for root, dirs, files in os.walk('.'):
-        for filename in files + dirs:
-            if match_pattern(filename, cleanup_patterns):
-                path = os.path.join(root, filename)
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                else:
-                    os.remove(path)
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.cache.
+    Uses the recorded run directory when available.
+    """
+    return cache.cleanup(getattr(rt, "run_dir", None))
 
 
 def refClean(filename):
@@ -437,28 +433,10 @@ def FASTAclean(ent):
     return bname,bseq
 
 def coreReserve(cores):
-    '''
-    Decides the core pool for machine - written to make PHASIS comaptible with machines that
-    '''
-    totalcores = int(multiprocessing.cpu_count())
-    if cores == 0:
-        ## Automatic assignment of cores selected
-        
-        if totalcores   == 4: ## For quad core system
-            ncores = 3
-        elif totalcores == 6: ## For hexa core system
-            ncores = 5
-        elif totalcores > 6 and totalcores <= 10: ## For octa core system and those with less than 10 cores
-            ncores = 7
-        else:
-            ncores = int(totalcores*0.95)
-    else:
-        ## Reserve user specifed cores
-        if cores > totalcores:
-            ncores = totalcores
-        else: ncores = int(cores*0.95)
-
-    return ncores
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.parallel.
+    """
+    return parallel_coreReserve(cores)
 
 def PPResults(module,alist):
     '''

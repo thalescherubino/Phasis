@@ -1,6 +1,34 @@
 import os, multiprocessing, gc, traceback, sys
 from tqdm import tqdm
 import phasis.runtime as rt
+
+
+def coreReserve(cores):
+    """
+    Canonical core-reservation helper extracted from legacy.py.
+    Behavior is intentionally kept identical to the legacy implementation.
+    """
+    totalcores = int(multiprocessing.cpu_count())
+    if cores == 0:
+        ## Automatic assignment of cores selected
+        if totalcores == 4: ## For quad core system
+            ncores = 3
+        elif totalcores == 6: ## For hexa core system
+            ncores = 5
+        elif totalcores > 6 and totalcores <= 10: ## For octa core system and those with less than 10 cores
+            ncores = 7
+        else:
+            ncores = int(totalcores * 0.95)
+    else:
+        ## Reserve user specifed cores
+        if cores > totalcores:
+            ncores = totalcores
+        else:
+            ncores = int(cores * 0.95)
+
+    return ncores
+
+
 def run_parallel_with_progress(
     func,
     data,
