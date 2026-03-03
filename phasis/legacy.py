@@ -60,6 +60,7 @@ from phasis.stages import candidates_merge as st_cmerge
 from phasis.stages import cluster_aggregation as st_cluster_aggregation
 from phasis.stages import phas_clusters as st_phas_clusters
 from phasis.stages import window_selection as st_winsel
+from phasis.stages import phase2_pipeline as st_phase2_pipeline
 from phasis.stages.phase2_pipeline import run_phase2_pipeline
 from phasis.stages.phase1_pipeline import run_phase1_pipeline, Phase1Hooks
 from phasis.stages import sam_parsing as st_sam_parsing
@@ -215,212 +216,20 @@ def cleanup():
                 else:
                     os.remove(path)
 
+
 def refClean(filename):
-    '''
-    Cleans FASTA file - multi-line fasta to single line, header clean, empty lines removal.
-    For runtype == 'G', forces numeric headers:
-      - Chr10/chr01/10 -> 10/1/10
-      - non-numeric contigs (Mt, Cp, UNMAPPED, scaffolds, etc.) -> max_numeric+1, +2, ...
-    Writes a mapping file: <basename>.chrom_id_map.tsv  (old_id, clean_id)
-    '''
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.stages.indexing.
+    """
+    return st_indexing.refClean(filename)
 
-    print("Phasis uses FASTA header as key for identifying the phased loci")
-    print("Caching '%s' reference FASTA file" % (filename))
-
-    base = filename.rpartition('/')[-1].rpartition('.')[0]
-    fastaclean = "%s/%s.clean.fa" % (os.getcwd(), base)
-    fastasumm  = "%s/%s.summ.txt" % (os.getcwd(), base)
-    mapfile    = "%s/%s.chrom_id_map.tsv" % (os.getcwd(), base)
-
-    # ---------- pass 1: collect headers and decide mapping ----------
-    orig_order = []
-    max_numeric = 0
-    numeric_candidate = {}  # orig -> int or None
-
-    # Only treat "Chr<digits>" or "<digits>" as numeric to avoid accidental collisions like scaffold_12 -> 12.
-    chr_re = re.compile(r'^(?:chr|Chr|CHR)?0*([0-9]+)$')
-
-    with open(filename, "r") as fh:
-        for line in fh:
-            if not line.startswith(">"):
-                continue
-            orig = line[1:].split()[0].strip()
-            orig_order.append(orig)
-
-            if runtype == "G":
-                m = chr_re.match(orig)
-                if m:
-                    val = int(m.group(1))  # strips leading zeros safely
-                    if val > 0:
-                        numeric_candidate[orig] = val
-                        if val > max_numeric:
-                            max_numeric = val
-                    else:
-                        numeric_candidate[orig] = None
-                else:
-                    numeric_candidate[orig] = None
-            else:
-                # non-genome runtype: keep as-is
-                numeric_candidate[orig] = orig
-
-    # Build final mapping (orig -> clean string)
-    mapping = {}
-    used = set()
-
-    if runtype == "G":
-        # First assign all true numeric chromosomes
-        for orig in orig_order:
-            val = numeric_candidate.get(orig, None)
-            if isinstance(val, int):
-                clean = str(val)
-                # Avoid collisions just in case
-                if clean in used:
-                    # collision: treat as non-numeric and assign later
-                    mapping[orig] = None
-                else:
-                    mapping[orig] = clean
-                    used.add(clean)
-            else:
-                mapping[orig] = None
-
-        # Then assign sequential integers to everything else
-        next_id = max_numeric + 1
-        for orig in orig_order:
-            if mapping[orig] is None:
-                while str(next_id) in used:
-                    next_id += 1
-                mapping[orig] = str(next_id)
-                used.add(str(next_id))
-                next_id += 1
-    else:
-        # Keep original IDs
-        for orig in orig_order:
-            mapping[orig] = str(numeric_candidate[orig])
-
-    # Write + print equivalence table
-    with open(mapfile, "w") as mf:
-        mf.write("old_id\tclean_id\n")
-        for orig in orig_order:
-            mf.write("%s\t%s\n" % (orig, mapping[orig]))
-
-    print("Chromosome/contig ID equivalence table (also saved to %s):" % mapfile)
-    if len(orig_order) <= 50:
-        for orig in orig_order:
-            print("  %s\t=>\t%s" % (orig, mapping[orig]))
-    else:
-        for orig in orig_order[:25]:
-            print("  %s\t=>\t%s" % (orig, mapping[orig]))
-        print("  ... (%d more) ..." % (len(orig_order) - 35))
-        for orig in orig_order[-10:]:
-            print("  %s\t=>\t%s" % (orig, mapping[orig]))
-
-    # ---------- pass 2: stream-write cleaned FASTA + summary ----------
-    fh_out1 = open(fastaclean, "w")
-    fh_out2 = open(fastasumm, "w")
-    fh_out2.write("Name\tLen\n")
-
-    acount = 0
-    empty_count = 0
-
-    cur_orig = None
-    cur_clean = None
-    seq_chunks = []
-
-    def flush_record():
-        nonlocal acount, empty_count, cur_clean, seq_chunks
-        if cur_clean is None:
-            return
-        seq = "".join(seq_chunks).replace(" ", "").replace("\t", "").replace("\r", "")
-        alen = len(seq)
-        if alen > 200:
-            fh_out1.write(">%s\n%s\n" % (cur_clean, seq))
-            fh_out2.write("%s\t%s\n" % (cur_clean, alen))
-            acount += 1
-        else:
-            empty_count += 1
-
-    with open(filename, "r") as fh:
-        for line in fh:
-            line = line.rstrip("\n")
-            if line.startswith(">"):
-                # flush previous
-                flush_record()
-                seq_chunks = []
-
-                cur_orig = line[1:].split()[0].strip()
-                cur_clean = mapping.get(cur_orig, None)
-                if not cur_clean:
-                    # Should never happen now, but guard anyway
-                    cur_clean = None
-            else:
-                if cur_clean is not None:
-                    seq_chunks.append(line.strip())
-
-        # flush last
-        flush_record()
-
-    fh_out1.close()
-    fh_out2.close()
-
-    print("Fasta file with reduced header: '%s' with total entries %s is prepared" % (fastaclean, acount))
-    print("There were %s entries found with empty sequences and were removed\n" % (empty_count))
-
-    return fastaclean, fastasumm
 
 
 def indexBuilder(reference,ncores):
-    '''
-    Generic index building module
-    '''
-    print ("#### Fn: indexBuilder #######################")
-    ### Clean reference ################
-    fastaclean,fastasumm = refClean(reference)
-    ### Prepare Index ##################
-    print ("**Deleting old index")
-    shutil.rmtree('./index', ignore_errors=True)
-    os.mkdir('./index')
-    genoIndex   = '%s/index/%s' % (os.getcwd(),fastaclean.rpartition('/')[-1].rpartition('.')[0]) ## Can be merged with genoIndex from earlier part if we use bowtie2 earlier
-    print('Creating index of cDNA/genomic sequences:%s**\n' % (genoIndex))
-    ncores      = str(ncores)
-    retcode     = subprocess.call(["hisat2-build","-p",ncores,"-f", fastaclean, genoIndex])
-    print(retcode)
-    if retcode == 0: ## The hisat mapping exit with status 0, all is well
-        pass
-    else:
-        print("There is some problem preparing index of reference '%s'" %  (reference))
-        print("Is Hisat2 installed? And added to environment variable?")
-        print("Script will exit now")
-        sys.exit()
-
-    ### Make a memory file ###################
-    print("Generating MD5 hash for HiSat2 index")
-    try:
-        refHash, indexHash, _index_marker = index_integrity.compute_index_fingerprints(
-            reference=reference,
-            genoIndex=genoIndex,
-            compute_fingerprint_fn=cache.compute_md5_str,
-        )
-    except FileNotFoundError:
-        print("File extension for index couldn't be determined properly")
-        print("It could be an issue from 'HiSat2'")
-        print("This needs to be reported to 'PHASIS' developer, report issue here\nhttps://github.com/atulkakrana/PHASIS/issues")
-        print("Script will exit")
-        sys.exit()
-    ## write to memory file
-    cache.write_mem_basic(
-        memFile,
-        ref_hash=refHash,
-        index_path=genoIndex,
-        index_hash=indexHash,
-        mindepth=mindepth,
-        clustbuffer=clustbuffer,
-        maxhits=maxhits,
-        mismat=mismat,
-    )
-    print("Index prepared:%s\n" % (genoIndex))
-    return genoIndex
-
-
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.stages.indexing.
+    """
+    return st_indexing.indexBuilder(reference, ncores)
 
 
 
@@ -428,15 +237,11 @@ def getindex(fh_run):
     """
     Thin wrapper to stage implementation (keeps legacy call sites stable).
     """
-    return st_indexing.getindex(
-        fh_run,
-        indexIntegrityCheck_fn=index_integrity.indexIntegrityCheck,
-        indexBuilder_fn=indexBuilder,
-        compute_md5_str_fn=compute_md5_str,
-    )
+    return st_indexing.getindex(fh_run)
 
 
 def indexIntegrityCheck(index):
+
     """
     Compatibility wrapper; canonical implementation lives in phasis.index_integrity.
     """
@@ -677,357 +482,68 @@ def aggregate_and_write_processed_clusters(clusterFiles, memFile_override=None):
 
 # ---- Single-library preprocessing ----
 def preprocess_single_library_clusters(mergedClusters):
-    mergedClusterDict = defaultdict(list)
-    for acount, apair in enumerate(mergedClusters):
-        aPname = apair[0]
-        mergedClusterDict[f"cluster_{acount}"].append(aPname)
-    return mergedClusterDict
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
+    """
+    return st_ids.preprocess_single_library_clusters(mergedClusters)
 
 # ---- Step 2: assemble candidate sets per chromosome ----
 def assemble_clusters_by_chromosome(mergedClusters_chr):
     """
-    Build merged sets per chromosome from pair list produced by merge_loci_pairs_by_chromosome.
-    Handles single-library case inside.
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
     """
-    mergedClusterDict = defaultdict(list)
-    assigned = set()
-    acount = 0
-
-    for apair in mergedClusters_chr:
-        aPname, bPname = apair[0], apair[1]
-
-        # Single library: just bucket everything 1-per-cluster (preProcess handles whole chr)
-        if aPname == bPname:
-            print("single-library chromosome: collapsing pairs")
-            mergedClusterDict = preprocess_single_library_clusters(mergedClusters_chr)
-            break
-
-        # Pair merging mode
-        if bPname != 'singleLibOccurrence':
-            if acount == 0 or aPname not in assigned:
-                key = f"cluster_{acount}"
-                mergedClusterDict[key].extend([aPname, bPname])
-                assigned.update([aPname, bPname])
-
-                # bring in more neighbors that share the same anchor (aPname)
-                for cPname, dPname in mergedClusters_chr:
-                    if (aPname, bPname) == (cPname, dPname):
-                        continue
-                    if aPname == cPname and dPname not in assigned and dPname != 'singleLibOccurrence':
-                        mergedClusterDict[key].append(dPname)
-                        assigned.add(dPname)
-                acount += 1
-
-        # Handle 'singleLibOccurrence' residuals
-        elif bPname == 'singleLibOccurrence':
-            if aPname not in assigned:
-                mergedClusterDict[f"cluster_{acount}"].append(aPname)
-                assigned.add(aPname)
-            acount += 1
-
-    return mergedClusterDict
+    return st_ids.assemble_clusters_by_chromosome(mergedClusters_chr)
 
 # ---- Step 3: assign final IDs per chromosome (genomic span keys) ----
 def assign_final_ids_by_chromosome(chromosome_df):
     """
-    Renames merged cluster IDs into genomic span keys (chrom:start..stop) per chromosome.
-    Uses a global mapping prepared by assign_final_cluster_ids().
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
     """
-    reNamesClusterDict = defaultdict(set)
-
-    chromosome_df['pos'] = pd.to_numeric(chromosome_df['pos'], errors='coerce')
-    chromosome_df['clusterID'] = chromosome_df['clusterID'].astype(str).str.strip()
-
-    cluster_info = chromosome_df.groupby('clusterID').agg(
-        start=('pos', 'min'),
-        stop=('pos', 'max')
-    ).to_dict('index')
-
-    chromosome = chromosome_df['chromosome'].iloc[0]
-
-    for entry in copy_mergedClusterDict_global:
-        cluster_ids = copy_mergedClusterDict_global[entry]
-        valid_cluster_ids = [cid for cid in cluster_ids if cid in cluster_info]
-        if not valid_cluster_ids:
-            continue
-
-        if len(valid_cluster_ids) == 1:
-            info = cluster_info[valid_cluster_ids[0]]
-            start, stop = info['start'], info['stop']
-        else:
-            starts = [cluster_info[cid]['start'] for cid in valid_cluster_ids]
-            stops  = [cluster_info[cid]['stop']  for cid in valid_cluster_ids]
-            start, stop = min(starts), max(stops)
-
-        reNamesClusterDict[f"{chromosome}:{start}..{stop}"].update(valid_cluster_ids)
-
-    return {k: list(v) for k, v in reNamesClusterDict.items()}
+    return st_ids.assign_final_ids_by_chromosome(chromosome_df)
 
 def assign_final_cluster_ids(mergedClusterDict, allClusters):
     """
-    Parallel per-chromosome remapping of mergedClusterDict -> genomic span IDs,
-    then flattened back into one dict with unique clusterIDs per span.
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
     """
-    chromosome_groups = [df for _, df in allClusters.groupby("chromosome")]
-
-    # sanitize keys/vals
-    copy_merged = {k.strip(): [cid.strip() for cid in v]
-                   for k, v in mergedClusterDict.items()}
-
-    global copy_mergedClusterDict_global
-    copy_mergedClusterDict_global = copy_merged
-
-    results = run_parallel_with_progress(
-        assign_final_ids_by_chromosome,
-        chromosome_groups,
-        desc="Assign final cluster IDs",
-        min_chunk=1,
-        unit="lib-chr"
-    )
-
-    flattened = defaultdict(list)
-    assigned = set()
-    for rd in results:
-        for k, vals in rd.items():
-            new_vals = [v for v in vals if v not in assigned]
-            assigned.update(new_vals)
-            flattened[k].extend(new_vals)
-
-    del copy_mergedClusterDict_global
-    return dict(flattened)
-
+    return st_ids.assign_final_cluster_ids(mergedClusterDict, allClusters)
 
 MERGED_REVERSE_BUILT = False
 
 def _ensure_reverse_index() -> dict:
     """
-    Ensure a usable reverse index exists and is visible under:
-      - rt.mergedClusterReverse
-      - globals()['MERGED_CLUSTER_REVERSE']
-      - globals()['mergedClusterReverse']  (compat)
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
     """
-    # 1) Prefer runtime if already present
-    if isinstance(getattr(rt, "mergedClusterReverse", None), dict) and rt.mergedClusterReverse:
-        globals()["MERGED_CLUSTER_REVERSE"] = rt.mergedClusterReverse
-        globals()["mergedClusterReverse"] = rt.mergedClusterReverse
-        return rt.mergedClusterReverse
-
-    # 2) If legacy global exists, ensure alias + runtime
-    rev = globals().get("MERGED_CLUSTER_REVERSE")
-    if isinstance(rev, dict) and rev:
-        globals()["mergedClusterReverse"] = rev
-        rt.mergedClusterReverse = rev
-        return rev
-
-    # 3) Build from mergedClusterDict
-    mcd = None
-    if isinstance(getattr(rt, "mergedClusterDict", None), dict) and rt.mergedClusterDict:
-        mcd = rt.mergedClusterDict
-    else:
-        mcd = globals().get("mergedClusterDict") or {}
-
-    rev = {}
-    for u, members in (mcd or {}).items():
-        for cid in members or []:
-            s = str(cid).strip()
-            if s:
-                rev[s] = str(u)
-
-    globals()["MERGED_CLUSTER_REVERSE"] = rev
-    globals()["mergedClusterReverse"] = rev
-    rt.mergedClusterReverse = rev
-    return rev
+    return st_ids._ensure_reverse_index()
 
 def _strip_fileprefix_from_id(cid: str,
                               lib: str | None = None,
                               phase: str | int | None = None) -> str:
     """
-    Remove glued filename/prefix from cluster IDs like:
-      ALL_LIBS.21-PHAS.candidate.clustersALL_LIBS-10_120402_10  ->  10_120402_10
-    Works with/without lib and phase; returns input if no match.
-    Leaves universal IDs (chr:start..end) untouched.
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
     """
-    s = str(cid)
-    if ":" in s and ".." in s:  # already universal
-        return s
-
-    pats = []
-    if phase is not None:
-        p = re.escape(str(phase))
-        if lib:
-            pats.append(rf"^{re.escape(lib)}\.{p}-PHAS\.candidate\.clusters{re.escape(lib)}-(.+)$")
-        # generic with any lib after 'clusters'
-        pats.append(rf"^[^.]+\.{p}-PHAS\.candidate\.clusters[^-]*-(.+)$")
-    # broad fallback: anything up to '.PHAS.candidate.clusters' then a '-' then the real ID
-    pats.append(r"^.+?\.PHAS\.candidate\.clusters[^-]*-(.+)$")
-
-    for pat in pats:
-        m = re.match(pat, s)
-        if m:
-            return m.group(1)
-    return s
+    return st_ids._strip_fileprefix_from_id(cid, lib=lib, phase=phase)
 
 def _normalize_cluster_id_for_lookup(x: str) -> str:
-    """Stringify, strip whitespace, and strip fileprefix based on `phase`.
-    Leaves coordinate universal IDs (chr:start..end) untouched."""
-    s = str(x).strip()
-    # If already universal, keep as-is
-    if ":" in s and ".." in s:
-        return s
-    return _strip_fileprefix_from_id(s, phase=phase)
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
+    """
+    return st_ids.normalize_cluster_id_for_lookup(x, phase=getattr(rt, "phase", None))
 
 def process_chromosome_data(loci_group):
     """
-    Process data for a single chromosome-library group.
-    STRICT: expects 20-column per-read/per-alignment rows with the schema below.
-    This avoids accidental use of 6-col merged-candidates rows, which lack per-read detail.
+    Compatibility wrapper; canonical implementation lives in phasis.stages.phas_clusters.
     """
-    expected_cols = [
-        "alib","clusterID","chromosome","strand","pos","len","hits","abun",
-        "pval_h_f","N_f","X_f","pval_r_f","pval_corr_f","pval_h_r","N_r",
-        "X_r","pval_r_r","pval_corr_r","tag_id","tag_seq"
-    ]
-
-    if not loci_group:
-        return pd.DataFrame(columns=expected_cols + ["identifier"])
-
-    width = len(loci_group[0])
-    if width != 20:
-        print(f"[WARN] process_chromosome_data got {width} columns (expected 20). "
-              "Did you pass merged-candidates instead of processed-clusters? Skipping group.")
-        return pd.DataFrame(columns=expected_cols + ["identifier"])
-
-    df = pd.DataFrame(loci_group, columns=expected_cols)
-
-    # light dtype normalization used later downstream
-    df["pos"]  = pd.to_numeric(df["pos"], errors="coerce")
-    df["len"]  = pd.to_numeric(df["len"], errors="coerce")
-    df["abun"] = pd.to_numeric(df["abun"], errors="coerce")
-    df = df.dropna(subset=["pos","len"]).reset_index(drop=True)
-
-    # Attach universal identifier (ensure mergedClusterDict has been prepared earlier)
-    df["identifier"] = df["clusterID"].map(getUniversalID)
-
-    # Drop rows we can't map
-    df = df.dropna(subset=["identifier"]).reset_index(drop=True)
-    return df
+    return st_phas_clusters.process_chromosome_data(loci_group)
 
 def assemble_candidate_clusters_parametric(
     mergedClusters: Sequence[Sequence[Any]],
     allClusters_df: pd.DataFrame,
     phase: str,
 ) -> Dict[str, List[str]]:
-
-    def _norm(x: Any) -> str | None:
-        """Normalize cluster id: stringify, strip, drop empty, strip prefix."""
-        if x is None:
-            return None
-        s = str(x).strip()
-        # NEW: drop sentinel rows entirely
-        if not s or s == "singleLibOccurrence":
-            return None
-        return _strip_fileprefix_from_id(s, phase=phase)
-
-    # --- NEW: build clusterID -> (chr, start, end) from loci table -----------
-    cid2coord: Dict[str, tuple[str,int,int]] = {}
-    try:
-        loci_path = phase2_basename('candidate.loci_table.tab')
-        ldf = pd.read_csv(loci_path, sep="\t")
-        # normalize headers
-        ldf = ldf.rename(columns={
-            "Cluster":"name", "value1":"pval",
-            "chromosome":"chr", "Start":"start", "End":"end"
-        })
-        # standardize types
-        ldf["chr"] = ldf["chr"].astype(str)
-        ldf["start"] = ldf["start"].astype(int)
-        ldf["end"] = ldf["end"].astype(int)
-        # keys need to match _norm(...)
-        for _, row in ldf.iterrows():
-            k = _norm(row["name"])
-            if k is not None:
-                cid2coord[k] = (row["chr"], int(row["start"]), int(row["end"]))
-    except Exception as e:
-        # stay permissive; we still produce groups, but keys may fallback
-        print(f"[WARN] assemble(): failed to build coord map from loci table: {e}")
-
-    # Union-Find / Disjoint Set (unchanged) -----------------------------------
-    parent: Dict[str, str] = {}
-    rank: Dict[str, int] = {}
-
-    def find(x: str) -> str:
-        parent.setdefault(x, x)
-        if parent[x] != x:
-            parent[x] = find(parent[x])
-        return parent[x]
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra == rb:
-            return
-        ra_rank = rank.get(ra, 0)
-        rb_rank = rank.get(rb, 0)
-        if ra_rank < rb_rank:
-            parent[ra] = rb
-        elif ra_rank > rb_rank:
-            parent[rb] = ra
-        else:
-            parent[rb] = ra
-            rank[ra] = ra_rank + 1
-
-    # 1) add edges from mergedClusters (unchanged except _norm handles sentinel)
-    if mergedClusters:
-        for pair in mergedClusters:
-            if not pair:
-                continue
-            a = _norm(pair[0]) if len(pair) >= 1 else None
-            b = _norm(pair[1]) if len(pair) >= 2 else None
-            if a:
-                parent.setdefault(a, a)
-            if b:
-                parent.setdefault(b, b)
-            if a and b:
-                union(a, b)
-
-    # 2) add singletons from allClusters_df (unchanged)
-    try:
-        if allClusters_df is not None and 'clusterID' in allClusters_df.columns:
-            for raw in allClusters_df['clusterID'].astype(str):
-                cid = _norm(raw)
-                if cid and cid not in parent:
-                    parent[cid] = cid
-    except Exception:
-        pass
-
-    if not parent:
-        return {}
-
-    # 3) connected components (unchanged)
-    comps: Dict[str, set] = {}
-    for node in list(parent.keys()):
-        root = find(node)
-        comps.setdefault(root, set()).add(node)
-
-    # 4) produce universal IDs as COORDINATE KEYS (changed block) -------------
-    mergedClusterDict: Dict[str, List[str]] = {}
-    for members in comps.values():
-        if not members:
-            continue
-        m_sorted = sorted(members)
-        # NEW: compute coordinate span across members (same chr by construction)
-        coords = [cid2coord.get(m) for m in m_sorted if m in cid2coord]
-        coords = [c for c in coords if c is not None]
-        if coords:
-            achr = coords[0][0]
-            smin = min(s for _, s, _ in coords)
-            emax = max(e for _, _, e in coords)
-            key = f"{achr}:{smin}..{emax}"
-        else:
-            # fallback to previous behavior if no coords available
-            key = m_sorted[0]
-        mergedClusterDict[key] = m_sorted
-
-    return mergedClusterDict
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
+    """
+    return st_ids.assemble_candidate_clusters_parametric(mergedClusters, allClusters_df, phase)
 
 def merge_candidate_clusters_parametric(loci_df, allClusters_df, phase, memFile, **kwargs):
     return st_ids.merge_candidate_clusters_parametric(
@@ -1039,57 +555,30 @@ _MERGED_DICT_LOCK = threading.Lock()
 _MERGED_REVERSE_BUILT = False
 
 def _identity_dict_from_tsv_firstcol(path: str, id_col=("Cluster","cluster","clusterID","name","cID")):
-    try:
-        df = pd.read_csv(path, sep="\t", engine="python")
-    except Exception:
-        # very loose fallback: no header
-        df = pd.read_csv(path, sep="\t", header=None, engine="python")
-        if df.shape[1] >= 1:
-            df.columns = ["Cluster"] + [f"col{i}" for i in range(2, df.shape[1]+1)]
-    # pick a usable ID column
-    col = next((c for c in id_col if c in df.columns), df.columns[0])
-    ids = df[col].astype(str).tolist()
-    return {cid: [cid] for cid in ids}
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
+    """
+    return st_ids._identity_dict_from_tsv_firstcol(path, id_col=id_col)
 
 def _strip_fileprefix_from_id(cid: str, alib: str = "", phase: str = "") -> str:
-    s = str(cid)
-    if phase:
-        pat = rf".*?\.{re.escape(str(phase))}-PHAS\.candidate\.clusters"
-        s = re.sub(pat, "", s)
-    return s.strip()
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
+    """
+    return st_ids._strip_fileprefix_from_id(cid, lib=alib, phase=phase)
 
 # --- helpers ---------------------------------------------------------------
 
 def _set_reverse_merged_map(mcd: dict) -> None:
-    """Cache clusterID -> universalID reverse map in both legacy globals and runtime."""
-    rev = {}
-    for u, members in (mcd or {}).items():
-        for cid in members or []:
-            s = str(cid).strip()
-            if s:
-                rev[s] = str(u)
-
-    # legacy globals
-    globals()["MERGED_CLUSTER_REVERSE"] = rev
-    globals()["mergedClusterReverse"] = rev  # compat alias
-
-    # runtime (single source of truth going forward)
-    rt.mergedClusterDict = mcd
-    rt.mergedClusterReverse = rev
-
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
+    """
+    return st_ids._set_reverse_merged_map(mcd)
 
 def _load_simple_tab_dict(path: str) -> dict:
-    """Load a key \t values... tab into {key: [values...]}; tolerate empty lines."""
-    out = {}
-    with open(path, "r") as fh:
-        for line in fh:
-            parts = line.rstrip("\n").split("\t")
-            if not parts or not parts[0]:
-                continue
-            key = parts[0].strip()
-            vals = [v for v in (p.strip() for p in parts[1:]) if v]
-            out[key] = vals if vals else [key]
-    return out
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.ids.
+    """
+    return st_ids._load_simple_tab_dict(path)
 
 def ensure_mergedClusterDict_always(*, concat_libs, phase, merged_out_path, loci_table_df, allClusters_df, memFile):
     return st_ids.ensure_mergedClusterDict_always(
@@ -1103,44 +592,16 @@ def ensure_mergedClusterDict_always(*, concat_libs, phase, merged_out_path, loci
 
 def load_processed_clusters_fallback(phase: str) -> pd.DataFrame:
     """
-    Module-level helper: load {phase}_processed_clusters.tab or return empty DF.
+    Compatibility wrapper; canonical implementation lives in phasis.stages.phas_clusters.
+    Keeps the legacy signature but ignores the explicit phase argument.
     """
-    proc_path = phase2_basename('processed_clusters.tab')
-    if os.path.isfile(proc_path):
-        print(f"  - Detected non-20-col input; loading processed-clusters fallback: {proc_path}")
-        return pd.read_csv(proc_path, sep="\t")
-    print(f"[WARN] Processed-clusters fallback not found: {proc_path}")
-    return pd.DataFrame()
+    return st_phas_clusters.load_processed_clusters_fallback()
 
 def _normalize_cluster_df(df: pd.DataFrame, is_concat: bool) -> pd.DataFrame:
     """
-    Normalize column names/required cols for downstream grouping.
-    - Ensures 'chromosome' column exists (renames 'chr' -> 'chromosome' if present).
-    - Ensures 'alib' exists (sets to 'ALL_LIBS' in concat mode if missing).
-    Returns the same DataFrame (mutated) for convenience.
+    Compatibility wrapper; canonical implementation lives in phasis.stages.phase2_pipeline.
     """
-    if df is None:
-        return pd.DataFrame()
-
-    # Rename chr -> chromosome if needed
-    if "chromosome" not in df.columns and "chr" in df.columns:
-        df.rename(columns={"chr": "chromosome"}, inplace=True)
-
-    # Ensure alib
-    if "alib" not in df.columns:
-        if is_concat:
-            df["alib"] = "ALL_LIBS"
-        else:
-            # Don’t guess in multi-lib; keep empty but warn
-            print("[WARN] DataFrame missing 'alib' in non-concat mode.")
-
-    return df
-
-# Global variables
-WINDOW_MULTIPLIER = 10  # 10 cycles
-# Global cache used by workers (read-only)
-# Alias to phasis.state.WIN_SCORE_LOOKUP (mutated in-place for spawn/fork safety)
-WIN_SCORE_LOOKUP = st.WIN_SCORE_LOOKUP
+    return st_phase2_pipeline._normalize_cluster_df(df, is_concat)
 
 def set_win_score_lookup(win_df: pd.DataFrame) -> dict:
     """
@@ -1168,94 +629,16 @@ WINDOW_MULTIPLIER = 10    # 10 cycles per window
 # ---------- Howell utilities (exact-phase only) ----------
 
 def _strand_masks(df: pd.DataFrame):
-    """Return boolean masks for W and C strands accepting several encodings."""
-    s = df['strand'].astype(str).str.lower()
-    w_mask = s.isin(['w', '+', 'watson', '1', 'true'])
-    c_mask = s.isin(['c', '-', 'crick', '0', 'false'])
-    return w_mask, c_mask
-
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.stages.feature_assembly.
+    """
+    return st_feature_assembly._strand_masks(df)
 
 def _build_pos_abun_exact_phase(df: pd.DataFrame, seq_start: int, seq_end: int, phase: int):
     """
-    Build {position -> abundance} using ONLY reads with length == phase
-    and positions within [seq_start, seq_end].
+    Compatibility wrapper; canonical implementation lives in phasis.stages.feature_assembly.
     """
-    ph = int(phase)
-    d: dict[int, float] = {}
-    # small speed-up: filter by length first
-    df_ph = df.loc[pd.to_numeric(df['len'], errors='coerce') == ph]
-    if df_ph.empty:
-        return d
-    for _, row in df_ph.iterrows():
-        pos = int(row['pos'])
-        if seq_start <= pos <= seq_end:
-            d[pos] = d.get(pos, 0.0) + float(row['abun'])
-    return d
-
-
-# ---------- RELAXED Howell (positional ±1 wobble allowed) ----------
-def _best_sliding_window_score_generic(pos_abun, phase, win_size, seq_start=None, seq_end=None, forward=True):
-    """
-    Generic window scan (relaxed Howell with ±1 wobble).
-    Expects pos_abun already filtered to len == phase.
-    """
-    positions = sorted(pos_abun.keys())
-    if not positions:
-        return 0.0, None, None
-
-    lower_bound = seq_start if seq_start is not None else positions[0]
-    upper_bound = (seq_end - win_size + 1) if seq_end is not None else positions[-1] - win_size + 1
-    if upper_bound < lower_bound:
-        lower_bound = positions[0]
-        upper_bound = lower_bound
-
-    best_score = -float("inf")
-    best_window = (None, None)
-
-    for win_start in range(lower_bound, upper_bound + 1):
-        win_end = win_start + win_size - 1
-        window_positions = [p for p in positions if win_start <= p <= win_end]
-        if not window_positions:
-            score = 0.0
-        else:
-            # Require at least 4 cycles possible in the window (n>3 guard)
-            num_cycles = max(0, (win_end - win_start + 1) // int(phase))
-            if num_cycles < 4:
-                score = 0.0
-            else:
-                best_reg_sum = 0.0
-                best_reg_total = 0.0
-                best_reg_filled = 0
-
-                for reg in range(int(phase)):
-                    in_sum, eff_total, n_filled = _evaluate_register(
-                        window_positions, pos_abun, win_start, win_end, int(phase), reg, forward=forward
-                    )
-                    if in_sum > best_reg_sum:
-                        best_reg_sum = in_sum
-                        best_reg_total = eff_total
-                        best_reg_filled = n_filled
-
-                out_of_phase = max(0.0, best_reg_total - best_reg_sum)  # U
-                numerator = best_reg_sum
-                denominator = 1.0 + out_of_phase
-                if numerator <= 0.0 or not (best_reg_filled > 3):
-                    score = 0.0
-                else:
-                    log_arg = 1.0 + 10.0 * (numerator / denominator)
-                    if log_arg <= 0.0 or log_arg != log_arg:  # NaN guard
-                        score = 0.0
-                    else:
-                        scale = max(min(best_reg_filled, num_cycles) - 2, 0)
-                        score = scale * (0.0 if log_arg <= 0 else np.log(log_arg))
-
-        if score > best_score:
-            best_score = score
-            best_window = (win_start, win_end)
-
-    return best_score if best_score != -float("inf") else 0.0, best_window[0], best_window[1]
-
-
+    return st_feature_assembly._build_pos_abun_exact_phase(df, seq_start, seq_end, phase)
 
 def best_sliding_window_score_forward(pos_abun, phase, win_size, seq_start=None, seq_end=None):
     return _best_sliding_window_score_generic(
@@ -1268,167 +651,22 @@ def best_sliding_window_score_reverse(pos_abun, phase, win_size, seq_start=None,
         pos_abun, phase, win_size, seq_start=seq_start, seq_end=seq_end, forward=False
     )
 
-
-def compute_phasing_score_Howell(aclust: pd.DataFrame):
-    """
-    Howell-like phasing WITH positional wobble (±1), but ONLY len == phase reads.
-    Returns: (w_score,(w_start,w_end), c_score,(c_start,c_end))
-    """
-    win_size  = WINDOW_MULTIPLIER * int(phase)
-    seq_start = int(aclust['pos'].min()); seq_end = int(aclust['pos'].max())
-    w_mask, c_mask = _strand_masks(aclust)
-
-    # Forward “w”
-    if w_mask.any():
-        w_pos_abun = _build_pos_abun_exact_phase(aclust.loc[w_mask], seq_start, seq_end, int(phase))
-        w_score, w_s, w_e = (
-            best_sliding_window_score_forward(w_pos_abun, int(phase), win_size, seq_start, seq_end)
-            if w_pos_abun else (0.0, None, None)
-        )
-    else:
-        w_score, w_s, w_e = None, None, None
-
-    # Reverse “c”
-    if c_mask.any():
-        c_pos_abun = _build_pos_abun_exact_phase(aclust.loc[c_mask], seq_start, seq_end, int(phase))
-        c_score, c_s, c_e = (
-            best_sliding_window_score_reverse(c_pos_abun, int(phase), win_size, seq_start, seq_end)
-            if c_pos_abun else (0.0, None, None)
-        )
-    else:
-        c_score, c_s, c_e = None, None, None
-
-    return (w_score, (w_s, w_e), c_score, (c_s, c_e))
-
-
 # ---------- STRICT Howell (NO positional wobble; still ONLY len == phase) ----------
 def _evaluate_register_strict_exact(window_positions, pos_abun, win_start, win_end, phase, reg, forward=True):
-    """Count ONLY exact register hits (no ±1). Returns: (in_phase_sum, total_in_window, n_filled_cycles)"""
-    positions_set = set(window_positions)
-    num_cycles = max(0, (win_end - win_start + 1) // int(phase))
-
-    in_phase_sum = 0.0
-    n_filled = 0
-    for c in range(num_cycles):
-        expected_pos = (win_start + reg + c * int(phase)) if forward else (win_end - reg - c * int(phase))
-        if expected_pos in positions_set:
-            in_phase_sum += pos_abun[expected_pos]
-            n_filled += 1
-
-    total_in_window = sum(pos_abun[p] for p in window_positions)
-    return in_phase_sum, total_in_window, n_filled
+    """
+    Compatibility wrapper; canonical implementation lives in phasis.stages.feature_assembly.
+    """
+    return st_feature_assembly._evaluate_register_strict_exact(
+        window_positions, pos_abun, win_start, win_end, phase, reg, forward=forward
+    )
 
 def _evaluate_register(window_positions, pos_abun, win_start, win_end, phase, reg, forward=True):
     """
-    Wobble-tolerant register evaluation (±1 positional wobble).
-    Returns: (in_phase_sum, effective_total, n_filled_cycles)
-    Semantics:
-      - If the exact expected position exists, count it for in-phase and quarantine its ±1 neighbors.
-      - Else, pick the better of the ±1 neighbors (if any) and quarantine the sibling neighbor.
-      - Each genomic position is counted at most once in-phase.
-      - Effective total excludes quarantined neighbors so they don't inflate U.
+    Compatibility wrapper; canonical implementation lives in phasis.stages.feature_assembly.
     """
-    ph = int(phase)
-    positions_set = set(window_positions)
-    num_cycles = max(0, (win_end - win_start + 1) // ph)
-
-    used_positions = set()     # positions used as in-phase
-    ignored_positions = set()  # neighbors to exclude from effective_total
-    in_phase_sum = 0.0
-    n_filled = 0
-
-    for c in range(num_cycles):
-        expected_pos = (win_start + reg + c * ph) if forward else (win_end - reg - c * ph)
-
-        # Case 1: exact exists -> use and quarantine neighbors
-        if expected_pos in positions_set and expected_pos not in used_positions:
-            in_phase_sum += pos_abun[expected_pos]
-            used_positions.add(expected_pos)
-            n_filled += 1
-            for off in (-1, 1):
-                npos = expected_pos + off
-                if npos in positions_set and npos not in used_positions:
-                    ignored_positions.add(npos)
-        else:
-            # Case 2: consider ±1; choose best if present; quarantine sibling neighbor
-            left = expected_pos - 1
-            right = expected_pos + 1
-            candidates = []
-            if left in positions_set and left not in used_positions:
-                candidates.append(left)
-            if right in positions_set and right not in used_positions:
-                candidates.append(right)
-            if candidates:
-                best = max(candidates, key=lambda p: pos_abun[p])
-                in_phase_sum += pos_abun[best]
-                used_positions.add(best)
-                n_filled += 1
-                sibling = right if best == left else left
-                if sibling in positions_set and sibling not in used_positions:
-                    ignored_positions.add(sibling)
-
-    # Effective total excludes quarantined neighbors of exact/selected hits
-    effective_positions = [p for p in window_positions if p not in ignored_positions]
-    effective_total = sum(pos_abun[p] for p in effective_positions)
-    return in_phase_sum, effective_total, n_filled
-
-def _best_sliding_window_score_generic_strict(pos_abun, phase, win_size, seq_start=None, seq_end=None, forward=True):
-    positions = sorted(pos_abun.keys())
-    if not positions:
-        return 0.0, None, None
-
-    lower_bound = seq_start if seq_start is not None else positions[0]
-    upper_bound = (seq_end - win_size + 1) if seq_end is not None else positions[-1] - win_size + 1
-    if upper_bound < lower_bound:
-        lower_bound = positions[0]
-        upper_bound = lower_bound
-
-    best_score = -float("inf")
-    best_window = (None, None)
-
-    for win_start in range(lower_bound, upper_bound + 1):
-        win_end = win_start + win_size - 1
-        window_positions = [p for p in positions if win_start <= p <= win_end]
-        if not window_positions:
-            score = 0.0
-        else:
-            num_cycles = max(0, (win_end - win_start + 1) // int(phase))
-            if num_cycles < 4:
-                score = 0.0
-            else:
-                best_reg_sum = 0.0
-                best_reg_total = 0.0
-                best_reg_filled = 0
-
-                for reg in range(int(phase)):
-                    in_sum, total, n_filled = _evaluate_register_strict_exact(
-                        window_positions, pos_abun, win_start, win_end, int(phase), reg, forward=forward
-                    )
-                    if in_sum > best_reg_sum:
-                        best_reg_sum = in_sum
-                        best_reg_total = total
-                        best_reg_filled = n_filled
-
-                out_of_phase = max(0.0, best_reg_total - best_reg_sum)
-                numerator = best_reg_sum
-                denominator = 1.0 + out_of_phase
-                if numerator <= 0.0 or not (best_reg_filled > 3):
-                    score = 0.0
-                else:
-                    log_arg = 1.0 + 10.0 * (numerator / denominator)
-                    if log_arg <= 0.0 or log_arg != log_arg:
-                        score = 0.0
-                    else:
-                        scale = max(min(best_reg_filled, num_cycles) - 2, 0)
-                        score = scale * (0.0 if log_arg <= 0 else np.log(log_arg))
-
-        if score > best_score:
-            best_score = score
-            best_window = (win_start, win_end)
-
-    return best_score if best_score != -float("inf") else 0.0, best_window[0], best_window[1]
-
-
+    return st_feature_assembly._evaluate_register(
+        window_positions, pos_abun, win_start, win_end, phase, reg, forward=forward
+    )
 
 def best_sliding_window_score_forward_strict(pos_abun, phase, win_size, seq_start=None, seq_end=None):
     return _best_sliding_window_score_generic_strict(
@@ -1441,75 +679,21 @@ def best_sliding_window_score_reverse_strict(pos_abun, phase, win_size, seq_star
         pos_abun, phase, win_size, seq_start=seq_start, seq_end=seq_end, forward=False
     )
 
+def _best_sliding_window_score_generic(pos_abun, phase, win_size, seq_start=None, seq_end=None, forward=True):
+    return st_feature_assembly._best_sliding_window_score_generic(
+        pos_abun, phase, win_size, seq_start=seq_start, seq_end=seq_end, forward=forward
+    )
+
+def compute_phasing_score_Howell(aclust: pd.DataFrame):
+    return st_feature_assembly.compute_phasing_score_Howell(aclust)
+
+def _best_sliding_window_score_generic_strict(pos_abun, phase, win_size, seq_start=None, seq_end=None, forward=True):
+    return st_feature_assembly._best_sliding_window_score_generic_strict(
+        pos_abun, phase, win_size, seq_start=seq_start, seq_end=seq_end, forward=forward
+    )
 
 def compute_phasing_score_Howell_strict(aclust: pd.DataFrame):
-    """
-    Classic Howell phasing WITHOUT positional wobble.
-    Uses ONLY len == phase reads.
-    Returns: (w_score,(w_start,w_end), c_score,(c_start,c_end))
-    """
-    win_size  = WINDOW_MULTIPLIER * int(phase)
-    seq_start = int(aclust['pos'].min()); seq_end = int(aclust['pos'].max())
-    w_mask, c_mask = _strand_masks(aclust)
-
-    # Forward “w”
-    if w_mask.any():
-        w_pos_abun = _build_pos_abun_exact_phase(aclust.loc[w_mask], seq_start, seq_end, int(phase))
-        w_score, w_s, w_e = (
-            best_sliding_window_score_forward_strict(w_pos_abun, int(phase), win_size, seq_start, seq_end)
-            if w_pos_abun else (0.0, None, None)
-        )
-    else:
-        w_score, w_s, w_e = None, None, None
-
-    # Reverse “c”
-    if c_mask.any():
-        c_pos_abun = _build_pos_abun_exact_phase(aclust.loc[c_mask], seq_start, seq_end, int(phase))
-        c_score, c_s, c_e = (
-            best_sliding_window_score_reverse_strict(c_pos_abun, int(phase), win_size, seq_start, seq_end)
-            if c_pos_abun else (0.0, None, None)
-        )
-    else:
-        c_score, c_s, c_e = None, None, None
-
-    return (w_score, (w_s, w_e), c_score, (c_s, c_e))
-
-def _parse_identifiers_and_alib(features: pd.DataFrame):
-    """
-    Return achr, start, end, cleaned alib arrays from features['identifier']/['alib'].
-    If 'identifier' is not in 'chr:start..end' form, try to resolve via MERGED_CLUSTER_REVERSE
-    using the row's 'cID'. Falls back to blanks to avoid IndexError.
-    """
-    achr, start, end = [], [], []
-    rmap = globals().get("MERGED_CLUSTER_REVERSE", {}) or {}
-
-    # iterate row-wise so we can look at both identifier and cID
-    for id_str, cID in zip(features["identifier"].astype(str), features.get("cID", pd.Series([None]*len(features)))):
-        u = None
-        if ":" in id_str and ".." in id_str:
-            u = id_str
-        else:
-            # try reverse map by cID first, then by the identifier string itself
-            if pd.notna(cID) and str(cID) in rmap:
-                u = rmap[str(cID)]
-            elif id_str in rmap:
-                u = rmap[id_str]
-
-        if u and ":" in u and ".." in u:
-            left, right = u.split(":", 1)
-            achr.append(left)
-            s_val, e_val = right.split("..", 1)
-            start.append(s_val)
-            end.append(e_val)
-        else:
-            achr.append("")
-            start.append("")
-            end.append("")
-
-    # keep alib as-is unless it ends with ".{phase}-PHAS.candidate"
-    alib_src = features["alib"].astype(str).tolist()
-    alib_ids = [re.sub(rf"\.{re.escape(str(phase))}-PHAS\.candidate$", "", x) for x in alib_src]
-    return achr, start, end, alib_ids
+    return st_feature_assembly.compute_phasing_score_Howell_strict(aclust)
 
 # ---------------------------------------------------------------------
 # Output + plotting stage wrappers (extracted to phasis.stages.output)

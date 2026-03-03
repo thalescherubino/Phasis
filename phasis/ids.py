@@ -460,6 +460,152 @@ def assemble_candidate_clusters_parametric(
     return mergedClusterDict
 
 
+
+# ---------------------------------------------------------------------
+# Legacy compatibility: moved from legacy.py (cluster assembly + ID helpers)
+# ---------------------------------------------------------------------
+
+copy_mergedClusterDict_global: Dict[str, List[str]] = {}
+
+def preprocess_single_library_clusters(mergedClusters: Sequence[Sequence[Any]]) -> Dict[str, List[str]]:
+    """
+    Legacy-compatible helper:
+    build one-member merged clusters for single-library mode.
+    """
+    mergedClusterDict: Dict[str, List[str]] = defaultdict(list)
+    for acount, apair in enumerate(mergedClusters):
+        aPname = apair[0]
+        mergedClusterDict[f"cluster_{acount}"].append(aPname)
+    return dict(mergedClusterDict)
+
+
+def assemble_clusters_by_chromosome(mergedClusters_chr: Sequence[Sequence[Any]]) -> Dict[str, List[str]]:
+    """
+    Build merged sets per chromosome from pair list produced by merge_loci_pairs_by_chromosome.
+    Handles single-library case inside.
+    """
+    mergedClusterDict: Dict[str, List[str]] = defaultdict(list)
+    assigned = set()
+    acount = 0
+
+    for apair in mergedClusters_chr:
+        aPname, bPname = apair[0], apair[1]
+
+        if aPname == bPname:
+            print("single-library chromosome: collapsing pairs")
+            return preprocess_single_library_clusters(mergedClusters_chr)
+
+        if bPname != "singleLibOccurrence":
+            if acount == 0 or aPname not in assigned:
+                key = f"cluster_{acount}"
+                mergedClusterDict[key].extend([aPname, bPname])
+                assigned.update([aPname, bPname])
+
+                for cPname, dPname in mergedClusters_chr:
+                    if (aPname, bPname) == (cPname, dPname):
+                        continue
+                    if aPname == cPname and dPname not in assigned and dPname != "singleLibOccurrence":
+                        mergedClusterDict[key].append(dPname)
+                        assigned.add(dPname)
+                acount += 1
+
+        elif aPname not in assigned:
+            mergedClusterDict[f"cluster_{acount}"].append(aPname)
+            assigned.add(aPname)
+            acount += 1
+        else:
+            acount += 1
+
+    return dict(mergedClusterDict)
+
+
+def assign_final_ids_by_chromosome(chromosome_df: pd.DataFrame) -> Dict[str, List[str]]:
+    """
+    Rename merged cluster IDs into genomic span keys (chrom:start..stop) per chromosome.
+    Uses the module-global mapping prepared by assign_final_cluster_ids().
+    """
+    reNamesClusterDict: Dict[str, set[str]] = defaultdict(set)
+
+    chromosome_df = chromosome_df.copy()
+    chromosome_df["pos"] = pd.to_numeric(chromosome_df["pos"], errors="coerce")
+    chromosome_df["clusterID"] = chromosome_df["clusterID"].astype(str).str.strip()
+
+    cluster_info = chromosome_df.groupby("clusterID").agg(
+        start=("pos", "min"),
+        stop=("pos", "max"),
+    ).to_dict("index")
+
+    chromosome = chromosome_df["chromosome"].iloc[0]
+
+    for entry in copy_mergedClusterDict_global:
+        cluster_ids = copy_mergedClusterDict_global[entry]
+        valid_cluster_ids = [cid for cid in cluster_ids if cid in cluster_info]
+        if not valid_cluster_ids:
+            continue
+
+        if len(valid_cluster_ids) == 1:
+            info = cluster_info[valid_cluster_ids[0]]
+            start, stop = info["start"], info["stop"]
+        else:
+            starts = [cluster_info[cid]["start"] for cid in valid_cluster_ids]
+            stops = [cluster_info[cid]["stop"] for cid in valid_cluster_ids]
+            start, stop = min(starts), max(stops)
+
+        reNamesClusterDict[f"{chromosome}:{start}..{stop}"].update(valid_cluster_ids)
+
+    return {k: list(v) for k, v in reNamesClusterDict.items()}
+
+
+def assign_final_cluster_ids(mergedClusterDict: Dict[str, List[str]], allClusters: pd.DataFrame) -> Dict[str, List[str]]:
+    """
+    Parallel per-chromosome remapping of mergedClusterDict -> genomic span IDs,
+    then flattened back into one dict with unique clusterIDs per span.
+    """
+    chromosome_groups = [df for _, df in allClusters.groupby("chromosome")]
+
+    copy_merged = {k.strip(): [cid.strip() for cid in v] for k, v in mergedClusterDict.items()}
+
+    global copy_mergedClusterDict_global
+    copy_mergedClusterDict_global = copy_merged
+
+    results = run_parallel_with_progress(
+        assign_final_ids_by_chromosome,
+        chromosome_groups,
+        desc="Assign final cluster IDs",
+        min_chunk=1,
+        unit="lib-chr",
+    )
+
+    flattened: Dict[str, List[str]] = defaultdict(list)
+    assigned = set()
+    for rd in results:
+        for k, vals in rd.items():
+            new_vals = [v for v in vals if v not in assigned]
+            assigned.update(new_vals)
+            flattened[k].extend(new_vals)
+
+    copy_mergedClusterDict_global = {}
+    return dict(flattened)
+
+
+def _identity_dict_from_tsv_firstcol(
+    path: str,
+    id_col: Sequence[str] = ("Cluster", "cluster", "clusterID", "name", "cID"),
+) -> Dict[str, List[str]]:
+    """
+    Build an identity mapping {cid: [cid]} from the first usable ID column in a TSV.
+    """
+    try:
+        df = pd.read_csv(path, sep="\t", engine="python")
+    except Exception:
+        df = pd.read_csv(path, sep="\t", header=None, engine="python")
+        if df.shape[1] >= 1:
+            df.columns = ["Cluster"] + [f"col{i}" for i in range(2, df.shape[1] + 1)]
+
+    col = next((c for c in id_col if c in df.columns), df.columns[0])
+    ids = df[col].astype(str).tolist()
+    return {cid: [cid] for cid in ids}
+
 def merge_candidate_clusters_parametric(
     loci_df: pd.DataFrame,
     allClusters_df: pd.DataFrame,
