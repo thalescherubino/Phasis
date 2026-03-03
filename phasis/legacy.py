@@ -8,47 +8,29 @@ version = 'v 2.5.3'
 #### IMPORTS ##############################################
 import phasis.runtime as rt
 import os
-import sys
 import threading
-import shutil
-import subprocess
-import multiprocessing
-import time
-import collections
-import argparse
-import re
-import configparser
-import pickle
-import datetime
-import hashlib
-from multiprocessing import Process, Queue, Pool, cpu_count
 from collections import defaultdict, OrderedDict, Counter
 from scipy.stats import hypergeom, mannwhitneyu, combine_pvalues
 from os.path import expanduser
 import pandas as pd
 import numpy as np
 from sklearn import preprocessing
-import warnings
 from sklearn.mixture import GaussianMixture
 from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.pyplot as plt
 import seaborn as sns
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes, Bbox
-import joblib
 try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
-import gc
 from matplotlib.colors import Normalize
 from matplotlib.patches import Rectangle
-import csv
-import traceback
 from typing import List, Sequence, Dict, Tuple, Any
-from phasis.parallel import run_parallel_with_progress, make_pool, safe_worker, _compute_initial_chunk_size, coreReserve as parallel_coreReserve
 from .cache import *   # re-export cache public API
 from .cache import __all__  # make "import *" stable
 from .cache import MEM_FILE_DEFAULT
+from . import parallel as parallel_utils
 from . import state as st
 from .stages import window_scoring as ws
 from phasis.stages import feature_assembly as st_feature_assembly
@@ -180,24 +162,11 @@ WINDOW_SIZE     = 15            ## Arbitrary window size;
 ###########################################################
 
 
-
 def checkDependency():
     """
     Thin wrapper to stage implementation (keeps legacy call sites stable).
     """
     return st_dependency_check.checkDependency()
-
-def fileexists(afile):
-    '''
-    test if file exists
-    '''
-    print("checking if file exists:%s" % (afile))
-    if os.path.isfile(afile):
-        abool = True
-    else:
-        abool = False
-    print(f"File available:{abool}")
-    return abool
 
 def match_pattern(filename, patterns):
     """
@@ -212,7 +181,6 @@ def cleanup():
     """
     return cache.cleanup(getattr(rt, "run_dir", None))
 
-
 def refClean(filename):
     """
     Compatibility wrapper; canonical implementation lives in phasis.stages.indexing.
@@ -220,13 +188,11 @@ def refClean(filename):
     return st_indexing.refClean(filename)
 
 
-
 def indexBuilder(reference,ncores):
     """
     Compatibility wrapper; canonical implementation lives in phasis.stages.indexing.
     """
     return st_indexing.indexBuilder(reference, ncores)
-
 
 
 def getindex(fh_run):
@@ -269,32 +235,6 @@ def readMem(memFile):
     return bool(memflag), index
 
 
-def libstoset(alist,akey):
-    '''
-    write library info to settings file
-    '''
-    fh_out = open(memFile,'a')
-    config = configparser.ConfigParser()
-    config.optionxform = str
-    config.read(memFile)
-    if config.has_section(akey):
-        ## subsequent run, add libraries
-        for anent in alist:
-            # print("Entry:",anent)
-            alib,ahash = anent
-            config[akey][alib] = ahash
-    else:
-        ## first run, make new section, and add libs
-        config[akey] = {}
-        for anent in alist:
-            # print(anent)
-            alib,ahash = anent
-            config[akey][alib] = ahash
-    ## write updated config
-    fh_out = open(memFile,'w')
-    config.write(fh_out)
-    fh_out.close()
-    return None
 def libraryprocess(libs):
     """
     Thin wrapper to stage implementation (keeps legacy call sites stable).
@@ -315,140 +255,17 @@ def mapprocess(libs, genoIndex):
 
     return libs_mapped
 
-def dictcollector(libs, libs_to_parse, lib_maps):
-    '''
-    This loads the two main dicts into memory for clustering and scoring of
-    libraries
-    '''
-    libs_nestdict = []  ## {libA-chr1:{pos:[taginfo1,taginfo2]}
-    libs_poscountdict = []  ## {libA-chr1:(pos1,count),libA-chr2:(pos2,count)}
-
-    total_libs = len(lib_maps)
-    
-    for nestdict_f, poscountdict_f, nestdict, poscountdict in lib_maps:
-        libs_nestdict.append(nestdict)
-        libs_poscountdict.append(poscountdict)
-    return libs_nestdict, libs_poscountdict
-
-def clustmerge(clustlist_all):
-    """
-    Revised clustmerge: Merges clusters if the next cluster’s start is within
-    the current cluster’s end plus the clustbuffer.
-    """
-    # Ensure clustlist_all is sorted by the starting coordinate of each cluster
-    if any(int(clustlist_all[i][0]) > int(clustlist_all[i+1][0])
-           for i in range(len(clustlist_all) - 1)):
-        clustlist_all.sort(key=lambda x: int(x[0]))
-        print("Sorting clusters before merging")
-
-    merged_clusters = []
-    # Start with the first cluster
-    current_cluster = clustlist_all[0][:]  # make a copy
-
-    for next_cluster in clustlist_all[1:]:
-        # If next cluster starts before or within the clustbuffer after current cluster's end,
-        # then merge them.
-        current_end = int(current_cluster[-1])
-        next_start = int(next_cluster[0])
-        if next_start <= current_end + int(clustbuffer):
-            # Merge and keep unique positions sorted
-            current_cluster = sorted(set(current_cluster + next_cluster), key=int)
-        else:
-            merged_clusters.append(current_cluster)
-            current_cluster = next_cluster[:]  # start a new cluster
-
-    # Append the final cluster
-    merged_clusters.append(current_cluster)
-    return merged_clusters
-
-def flatten_list_of_dict(alist):
-    '''
-    input: a list of dicts
-    takes a list of dict and flattens to a dict
-    output: a dict
-    '''
-    resdict = {}
-    for i, adict in enumerate(alist):
-        if not isinstance(adict, dict):
-            print(f"Error: Element at index {i} is not a dictionary, it's a {type(adict)}: {adict}")
-            continue  # Skip non-dictionary elements
-        
-        # Now proceed with normal execution if adict is a dictionary
-        akeys = adict.keys()  # akeys are lib-chrs for this library
-        for akey in akeys:
-            # Fetch position-specific dict of tag infos
-            bdict = adict[akey]
-            resdict[akey] = bdict
-    return resdict
-
-
-
-def cacheclustdicts(libchrs_keys,libchr_clustered,clustfolder):
-    '''
-    reads long cluster and short cluster dicts
-    to memory
-    '''
-    ## find which libchr elements are already in
-    ## memory from current run and avoid reading
-    ## these again. Those in memory must have been
-    ## re-read due to some parameter change upstream
-    libchr_to_read  = []
-    for akey in libchrs_keys:
-        if akey not in libchr_clustered:
-            libchr_to_read.append(akey)
-    ## read clust dicts for scoring
-    libschrs_posdict_l  = []
-    libschrs_nestdict_d = {}
-    acount              = 0
-    for akey in libchr_to_read:
-        infile1         = "%s/%s.lclust"    % (clustfolder,akey)
-        infile2         = "%s/%s.sclust"    % (clustfolder,akey)
-        infile3         = "%s_%s.dict"         % (akey,phase)
-        ldict           = pickle.load( open(infile1, "rb" ) )
-        sdict           = pickle.load( open(infile2, "rb" ) )
-        ndict           = pickle.load( open(infile3, "rb" ) )
-        libschrs_posdict_l.append((akey,ldict,sdict))
-        libschrs_nestdict_d[akey] = ndict
-        acount          +=1
-    return libschrs_posdict_l,libschrs_nestdict_d
-
 def createfolders(currdir):
     """
     Thin wrapper to stage implementation (keeps legacy call sites stable).
     """
     return st_folder_setup.createfolders(currdir)
 
-def FASTAclean(ent):
-    '''
-    Cleans one entry of FASTA file - multi-line fasta to single line, header clean, empty lines removal
-    '''
-    ent_splt    = ent.split('\n')
-    aname       = ent_splt[0].split()[0].strip()
-    if runtype == 'G':
-        ## To match with phasing-core script for genome version which removed non-numeric and preceding 0s
-        bname = re.sub("[^0-9]", "", aname).lstrip('0')
-    else:
-        bname = aname
-    bseq     = ''.join(x.strip() for x in ent[1:]) ## Sequence in multiple lines
-    return bname,bseq
-
 def coreReserve(cores):
     """
     Compatibility wrapper; canonical implementation lives in phasis.parallel.
     """
-    return parallel_coreReserve(cores)
-
-def PPResults(module,alist):
-    '''
-    Parallelizes and stores result, uses raw size of cores
-    '''
-    npool   = multiprocessing.get_context("fork").Pool(int(ncores))
-    res     = npool.map_async(module, alist)
-    results = (res.get())
-    npool.close()
-    return results
-
-#part II, cluster process
+    return parallel_utils.coreReserve(cores)
 
 def process_single_lib_cluster(filename):
     return st_cluster_aggregation.process_single_lib_cluster(filename)
@@ -493,12 +310,19 @@ def _ensure_reverse_index() -> dict:
     """
     return st_ids._ensure_reverse_index()
 
-def _strip_fileprefix_from_id(cid: str,
-                              lib: str | None = None,
-                              phase: str | int | None = None) -> str:
+def _strip_fileprefix_from_id(
+    cid: str,
+    lib: str | None = None,
+    phase: str | int | None = None,
+    alib: str | None = None,
+) -> str:
     """
     Compatibility wrapper; canonical implementation lives in phasis.ids.
+
+    Accepts both the newer ``lib=`` form and the legacy ``alib=`` form.
     """
+    if lib is None and alib is not None:
+        lib = alib
     return st_ids._strip_fileprefix_from_id(cid, lib=lib, phase=phase)
 
 def _normalize_cluster_id_for_lookup(x: str) -> str:
@@ -537,14 +361,6 @@ def _identity_dict_from_tsv_firstcol(path: str, id_col=("Cluster","cluster","clu
     Compatibility wrapper; canonical implementation lives in phasis.ids.
     """
     return st_ids._identity_dict_from_tsv_firstcol(path, id_col=id_col)
-
-def _strip_fileprefix_from_id(cid: str, alib: str = "", phase: str = "") -> str:
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.ids.
-    """
-    return st_ids._strip_fileprefix_from_id(cid, lib=alib, phase=phase)
-
-# --- helpers ---------------------------------------------------------------
 
 def _set_reverse_merged_map(mcd: dict) -> None:
     """

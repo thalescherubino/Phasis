@@ -16,14 +16,21 @@ MEM_FILE_DEFAULT = "phasis.mem"
 
 
 CLEANUP_PATTERNS = [
-    'fas', 'sam', 'dict', 'count', 'runtime', 'sum', 'count',
-    'scoredClusters', 'candidate.clusters', 'clusters',
+    "fas",
+    "sam",
+    "dict",
+    "count",
+    "runtime",
+    "sum",
+    "scoredClusters",
+    "candidate.clusters",
+    "clusters",
 ]
 
 
-def match_pattern(filename, patterns):
+def match_pattern(filename, patterns) -> bool:
     for pattern in patterns:
-        if filename.endswith(pattern):
+        if str(filename).endswith(str(pattern)):
             return True
     return False
 
@@ -36,8 +43,11 @@ def cleanup(base_dir: str | None = None, patterns=None) -> None:
     support -cleanup without routing cleanup logic through legacy.
     """
     cleanup_patterns = list(patterns or CLEANUP_PATTERNS)
-    target_dir = base_dir or getattr(rt, 'run_dir', None) or os.getcwd()
+    target_dir = base_dir or getattr(rt, "run_dir", None) or os.getcwd()
     target_dir = os.path.abspath(os.path.expanduser(target_dir))
+
+    if not os.path.isdir(target_dir):
+        return None
 
     for root, dirs, files in os.walk(target_dir, topdown=True):
         for dirname in list(dirs):
@@ -50,6 +60,8 @@ def cleanup(base_dir: str | None = None, patterns=None) -> None:
             if match_pattern(filename, cleanup_patterns):
                 path = os.path.join(root, filename)
                 os.remove(path)
+
+    return None
 
 
 def phase2_basename(base_name:str)->str:

@@ -127,3 +127,152 @@ def gmm_classify(
 
     out = _apply_post_filters(out, phasisScoreCutoff, min_Howell_score, max_complexity)
     return out
+
+
+def resolve_pipeline_classification_args(
+    *,
+    cfg=None,
+    phasisScoreCutoff=None,
+    min_Howell_score=None,
+    max_complexity=None,
+    job_outdir=None,
+    job_phase=None,
+    default_phasisScoreCutoff=None,
+    default_min_Howell_score=None,
+    default_max_complexity=None,
+    default_job_outdir=None,
+    default_job_phase=None,
+):
+    """
+    Resolve legacy/runtime-facing classification args outside legacy.py.
+
+    This keeps stage-owned parameter normalization together with the
+    classification stage while remaining pure (no file writing).
+    """
+    if cfg is not None:
+        phasisScoreCutoff = cfg.phasisScoreCutoff
+        min_Howell_score = cfg.min_Howell_score
+        max_complexity = cfg.max_complexity
+        job_outdir = cfg.outdir
+        job_phase = cfg.phase
+
+    if phasisScoreCutoff is None:
+        phasisScoreCutoff = default_phasisScoreCutoff
+    if min_Howell_score is None:
+        min_Howell_score = default_min_Howell_score
+    if max_complexity is None:
+        max_complexity = default_max_complexity
+    if job_outdir is None:
+        job_outdir = default_job_outdir
+    if job_phase is None:
+        job_phase = default_job_phase
+
+    return (
+        float(phasisScoreCutoff),
+        float(min_Howell_score),
+        float(max_complexity),
+        job_outdir,
+        job_phase,
+    )
+
+
+def knn_classify_for_pipeline(
+    features: pd.DataFrame,
+    *,
+    cfg=None,
+    phasisScoreCutoff=None,
+    min_Howell_score=None,
+    max_complexity=None,
+    job_outdir=None,
+    job_phase=None,
+    default_phasisScoreCutoff=None,
+    default_min_Howell_score=None,
+    default_max_complexity=None,
+    default_job_outdir=None,
+    default_job_phase=None,
+):
+    """
+    Legacy/pipeline-facing KNN helper.
+
+    Returns:
+        (labeled_df, job_outdir, job_phase)
+    """
+    (
+        phasisScoreCutoff,
+        min_Howell_score,
+        max_complexity,
+        job_outdir,
+        job_phase,
+    ) = resolve_pipeline_classification_args(
+        cfg=cfg,
+        phasisScoreCutoff=phasisScoreCutoff,
+        min_Howell_score=min_Howell_score,
+        max_complexity=max_complexity,
+        job_outdir=job_outdir,
+        job_phase=job_phase,
+        default_phasisScoreCutoff=default_phasisScoreCutoff,
+        default_min_Howell_score=default_min_Howell_score,
+        default_max_complexity=default_max_complexity,
+        default_job_outdir=default_job_outdir,
+        default_job_phase=default_job_phase,
+    )
+
+    labeled = knn_classify(
+        features,
+        phasisScoreCutoff=phasisScoreCutoff,
+        min_Howell_score=min_Howell_score,
+        max_complexity=max_complexity,
+    )
+    return labeled, job_outdir, job_phase
+
+
+def gmm_classify_for_pipeline(
+    features: pd.DataFrame,
+    n_clusters: int = 2,
+    *,
+    cfg=None,
+    phasisScoreCutoff=None,
+    min_Howell_score=None,
+    max_complexity=None,
+    job_outdir=None,
+    job_phase=None,
+    default_phasisScoreCutoff=None,
+    default_min_Howell_score=None,
+    default_max_complexity=None,
+    default_job_outdir=None,
+    default_job_phase=None,
+):
+    """
+    Legacy/pipeline-facing GMM helper.
+
+    Returns:
+        (labeled_df, job_outdir, job_phase)
+    """
+    (
+        phasisScoreCutoff,
+        min_Howell_score,
+        max_complexity,
+        job_outdir,
+        job_phase,
+    ) = resolve_pipeline_classification_args(
+        cfg=cfg,
+        phasisScoreCutoff=phasisScoreCutoff,
+        min_Howell_score=min_Howell_score,
+        max_complexity=max_complexity,
+        job_outdir=job_outdir,
+        job_phase=job_phase,
+        default_phasisScoreCutoff=default_phasisScoreCutoff,
+        default_min_Howell_score=default_min_Howell_score,
+        default_max_complexity=default_max_complexity,
+        default_job_outdir=default_job_outdir,
+        default_job_phase=default_job_phase,
+    )
+
+    labeled = gmm_classify(
+        features,
+        phasisScoreCutoff=phasisScoreCutoff,
+        min_Howell_score=min_Howell_score,
+        max_complexity=max_complexity,
+        n_clusters=int(n_clusters),
+    )
+    return labeled, job_outdir, job_phase

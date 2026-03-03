@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import os
 
-from . import cache as cache_utils
-from .parallel import coreReserve
+from . import cache
+from . import parallel as parallel_utils
 
 
 def run_pipeline() -> int:
@@ -18,8 +18,8 @@ def run_pipeline() -> int:
     # Sync legacy globals from runtime snapshot/config
     legacy.sync_from_runtime()
 
-    # legacy startup sequence (same order as before)
-    legacy.ncores = coreReserve(legacy.cores)
+    # startup sequence (same order as before)
+    legacy.ncores = parallel_utils.coreReserve(legacy.cores)
 
     # Step-2 bridge (parallel.py will read rt.ncores)
     rt.ncores = legacy.ncores
@@ -34,8 +34,9 @@ def run_pipeline() -> int:
     # ---- dispatcher (moved out of legacy) ----
     steps_local = getattr(rt, "steps", None) or getattr(legacy, "steps", "both")
     steps_local = str(steps_local).strip().lower()
+    cleanup_requested = bool(getattr(rt, "cleanup", False))
 
-    if getattr(rt, "cleanup", False) and steps_local != "both":
+    if cleanup_requested and steps_local != "both":
         print("[ERROR] -cleanup is only supported when steps is 'both'.")
         return 1
 
@@ -52,7 +53,7 @@ def run_pipeline() -> int:
             f"Unknown steps value: {steps_local!r} (expected 'cfind', 'class', or 'both')"
         )
 
-    if getattr(rt, "cleanup", False):
-        cache_utils.cleanup(getattr(rt, "run_dir", None))
+    if cleanup_requested:
+        cache.cleanup(getattr(rt, "run_dir", None))
 
     return 0
