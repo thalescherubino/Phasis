@@ -12,29 +12,24 @@ def run_pipeline() -> int:
     os.environ.setdefault("MPLBACKEND", "Agg")
 
     # Heavy imports happen here (run path only)
-    from . import bridge
     from . import runtime as rt
+    from .stages import dependency_check as st_dependency_check
+    from .stages import input_validation as st_input_validation
     from .stages.phase1_pipeline import run_phase1_pipeline
     from .stages.phase2_pipeline import run_phase2_pipeline
 
-    # Sync bridge globals from runtime snapshot/config
-    bridge.sync_from_runtime()
+    # Reserve worker cores and publish to runtime for pool creation
+    rt.ncores = parallel_utils.coreReserve(rt.cores)
 
     # startup sequence (same order as before)
-    bridge.ncores = parallel_utils.coreReserve(bridge.cores)
+    st_dependency_check.checkDependency()
+    libs_checked = st_input_validation.checkLibs()
 
-    # Step-2 bridge (parallel.py will read rt.ncores)
-    rt.ncores = bridge.ncores
-
-    bridge.checkDependency()
-    libs_checked = bridge.checkLibs()
-
-    # keep legacy + runtime consistent
-    bridge.libs = libs_checked
+    # keep validated runtime inputs consistent
     rt.libs = libs_checked
 
-    # ---- dispatcher (moved out of legacy) ----
-    steps_local = getattr(rt, "steps", None) or getattr(bridge, "steps", "both")
+    # ---- dispatcher ----
+    steps_local = getattr(rt, "steps", None) or "both"
     steps_local = str(steps_local).strip().lower()
     cleanup_requested = bool(getattr(rt, "cleanup", False))
 
@@ -45,7 +40,7 @@ def run_pipeline() -> int:
     if steps_local == "cfind":
         run_phase1_pipeline(libs_checked)
     elif steps_local == "class":
-        # run_phase2() will pull cfg from runtime and override clusterFilePaths
+        # run_phase2_pipeline() will pull cfg from runtime and override clusterFilePaths
         run_phase2_pipeline([])
     elif steps_local == "both":
         clusterFilePaths = run_phase1_pipeline(libs_checked)

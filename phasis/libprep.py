@@ -4,7 +4,7 @@ import collections
 import phasis.runtime as rt
 
 # Module-level default used by legacy-style call sites.
-# legacy.sync_from_runtime() will set this for spawn-safety.
+# Workers read the value from phasis.runtime when this stays unset.
 mindepth = None
 
 

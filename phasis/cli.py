@@ -98,7 +98,7 @@ def _validate_args(args: argparse.Namespace) -> None:
 def configure_runtime(args: argparse.Namespace) -> None:
     """
     Single source of truth: write configuration into phasis.runtime (rt.*).
-    Legacy globals will be mirrored from rt right before execution.
+    Worker processes will rehydrate from the saved runtime snapshot.
     """
     _validate_args(args)
 
@@ -154,26 +154,6 @@ def configure_runtime(args: argparse.Namespace) -> None:
     rt.run_dir = os.path.abspath(os.getcwd())
     rt.memFile = os.path.join(rt.run_dir, "phasis.mem")
 
-def sync_bridge_globals_from_runtime(bridge_module) -> None:
-    """
-    Startup bridge helper: mirror rt.* into the bridge module so compatibility
-    wrappers see the same runtime-backed globals.
-    """
-    names = [
-        "libs", "reference", "norm", "norm_factor", "maxhits", "runtype", "mindepth",
-        "uniqueRatioCut", "max_complexity", "mismat", "libformat", "phase", "clustbuffer",
-        "phasisScoreCutoff", "minClusterLength", "window_len", "sliding", "cores",
-        "classifier", "steps", "class_cluster_file", "min_Howell_score", "concat_libs",
-        "outdir", "memFile",
-        # optional (may be referenced in some places)
-        "force", "cleanup",
-        # state objects (phase II)
-        "mergedClusterDict", "mergedClusterReverse", "WIN_SCORE_LOOKUP",
-    ]
-    for n in names:
-        if hasattr(rt, n):
-            setattr(bridge_module, n, getattr(rt, n))
-
 
 def main(argv: Optional[List[str]] = None) -> int:
     if argv is None:
@@ -196,7 +176,5 @@ def main(argv: Optional[List[str]] = None) -> int:
     # set this BEFORE importing anything that might import matplotlib.
     os.environ.setdefault("MPLBACKEND", "Agg")
 
-    # Prefer: run pipeline orchestration (which may call the bridge under the hood)
-    from . import bridge
-    sync_bridge_globals_from_runtime(bridge)
+    # Run the pipeline orchestrator directly.
     return run_pipeline()

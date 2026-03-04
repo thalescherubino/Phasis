@@ -2,7 +2,6 @@ LICENSE.txt
 README.md
 pyproject.toml
 phasis/__init__.py
-phasis/bridge.py
 phasis/cache.py
 phasis/cli.py
 phasis/config.py
@@ -10,7 +9,6 @@ phasis/deps_check.py
 phasis/from.hive.phasis.py
 phasis/ids.py
 phasis/index_integrity.py
-phasis/legacy.py
 phasis/libprep.py
 phasis/parallel.py
 phasis/pipeline.py

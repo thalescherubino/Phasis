@@ -226,13 +226,8 @@ def _pool_initializer(snapshot_path, kind):
     except Exception:
         pass
 
-    # Sync bridge globals from runtime if the function exists
-    try:
-        from . import bridge
-        if hasattr(bridge, "sync_from_runtime"):
-            bridge.sync_from_runtime()
-    except Exception:
-        pass
+    # No compatibility module is needed here anymore.
+    # Workers read phasis.runtime directly (or via stage-local sync helpers).
 
 
 def make_pool(nworkers: int | None = None, *, processes: int | None = None, start_method: str | None = None,

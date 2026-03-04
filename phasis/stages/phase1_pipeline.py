@@ -7,7 +7,7 @@ phasis.stages.phase1_pipeline
 Phase I ("cfind") orchestrator.
 
 This stage now calls the extracted Phase I stage modules directly and no longer
-requires a compatibility-hook bundle from phasis.bridge.
+depends on any temporary compatibility module.
 
 Design constraints:
 - spawn-safe (top-level functions only)
@@ -44,7 +44,7 @@ def run_phase1_pipeline(
     Parameters
     ----------
     libs:
-        List of library inputs (already validated by bridge.checkLibs()).
+        List of library inputs (already validated by input validation).
     cfg:
         Reserved for future Phase I config. Currently unused (kept for API symmetry).
     workdir:
