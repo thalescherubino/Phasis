@@ -2,6 +2,7 @@ LICENSE.txt
 README.md
 pyproject.toml
 phasis/__init__.py
+phasis/bridge.py
 phasis/cache.py
 phasis/cli.py
 phasis/config.py

@@ -12,27 +12,29 @@ def run_pipeline() -> int:
     os.environ.setdefault("MPLBACKEND", "Agg")
 
     # Heavy imports happen here (run path only)
-    from . import legacy
+    from . import bridge
     from . import runtime as rt
+    from .stages.phase1_pipeline import run_phase1_pipeline
+    from .stages.phase2_pipeline import run_phase2_pipeline
 
-    # Sync legacy globals from runtime snapshot/config
-    legacy.sync_from_runtime()
+    # Sync bridge globals from runtime snapshot/config
+    bridge.sync_from_runtime()
 
     # startup sequence (same order as before)
-    legacy.ncores = parallel_utils.coreReserve(legacy.cores)
+    bridge.ncores = parallel_utils.coreReserve(bridge.cores)
 
     # Step-2 bridge (parallel.py will read rt.ncores)
-    rt.ncores = legacy.ncores
+    rt.ncores = bridge.ncores
 
-    legacy.checkDependency()
-    libs_checked = legacy.checkLibs()
+    bridge.checkDependency()
+    libs_checked = bridge.checkLibs()
 
     # keep legacy + runtime consistent
-    legacy.libs = libs_checked
+    bridge.libs = libs_checked
     rt.libs = libs_checked
 
     # ---- dispatcher (moved out of legacy) ----
-    steps_local = getattr(rt, "steps", None) or getattr(legacy, "steps", "both")
+    steps_local = getattr(rt, "steps", None) or getattr(bridge, "steps", "both")
     steps_local = str(steps_local).strip().lower()
     cleanup_requested = bool(getattr(rt, "cleanup", False))
 
@@ -41,13 +43,13 @@ def run_pipeline() -> int:
         return 1
 
     if steps_local == "cfind":
-        legacy.run_phase1(libs_checked)
+        run_phase1_pipeline(libs_checked)
     elif steps_local == "class":
         # run_phase2() will pull cfg from runtime and override clusterFilePaths
-        legacy.run_phase2([])
+        run_phase2_pipeline([])
     elif steps_local == "both":
-        clusterFilePaths = legacy.run_phase1(libs_checked)
-        legacy.run_phase2(clusterFilePaths)
+        clusterFilePaths = run_phase1_pipeline(libs_checked)
+        run_phase2_pipeline(clusterFilePaths)
     else:
         raise ValueError(
             f"Unknown steps value: {steps_local!r} (expected 'cfind', 'class', or 'both')"

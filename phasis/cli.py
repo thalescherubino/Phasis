@@ -154,10 +154,10 @@ def configure_runtime(args: argparse.Namespace) -> None:
     rt.run_dir = os.path.abspath(os.getcwd())
     rt.memFile = os.path.join(rt.run_dir, "phasis.mem")
 
-def sync_legacy_globals_from_runtime(legacy_module) -> None:
+def sync_bridge_globals_from_runtime(bridge_module) -> None:
     """
-    Backward-compat bridge: legacy still reads many globals directly.
-    Mirror rt.* into legacy module attributes so the old code keeps working.
+    Startup bridge helper: mirror rt.* into the bridge module so compatibility
+    wrappers see the same runtime-backed globals.
     """
     names = [
         "libs", "reference", "norm", "norm_factor", "maxhits", "runtype", "mindepth",
@@ -172,7 +172,7 @@ def sync_legacy_globals_from_runtime(legacy_module) -> None:
     ]
     for n in names:
         if hasattr(rt, n):
-            setattr(legacy_module, n, getattr(rt, n))
+            setattr(bridge_module, n, getattr(rt, n))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -196,7 +196,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # set this BEFORE importing anything that might import matplotlib.
     os.environ.setdefault("MPLBACKEND", "Agg")
 
-    # Prefer: run pipeline orchestration (which may call legacy under the hood)
-    from . import legacy
-    sync_legacy_globals_from_runtime(legacy)
+    # Prefer: run pipeline orchestration (which may call the bridge under the hood)
+    from . import bridge
+    sync_bridge_globals_from_runtime(bridge)
     return run_pipeline()

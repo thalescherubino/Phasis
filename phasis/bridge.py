@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+"""Temporary compatibility bridge during legacy retirement."""
 
 version = 'v 2.5.3'
 
@@ -9,24 +10,12 @@ version = 'v 2.5.3'
 import phasis.runtime as rt
 import os
 import threading
-from collections import defaultdict, OrderedDict, Counter
-from scipy.stats import hypergeom, mannwhitneyu, combine_pvalues
-from os.path import expanduser
 import pandas as pd
-import numpy as np
-from sklearn import preprocessing
-from sklearn.mixture import GaussianMixture
-from matplotlib.colors import LinearSegmentedColormap
-import matplotlib.pyplot as plt
-import seaborn as sns
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes, Bbox
 try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
-from matplotlib.colors import Normalize
-from matplotlib.patches import Rectangle
-from typing import List, Sequence, Dict, Tuple, Any
+from typing import List, Sequence, Dict, Any
 from .cache import *   # re-export cache public API
 from .cache import __all__  # make "import *" stable
 from .cache import MEM_FILE_DEFAULT
@@ -42,18 +31,10 @@ from phasis.stages import candidates_merge as st_cmerge
 from phasis.stages import cluster_aggregation as st_cluster_aggregation
 from phasis.stages import phas_clusters as st_phas_clusters
 from phasis.stages import window_selection as st_winsel
-from phasis.stages import phase2_pipeline as st_phase2_pipeline
 from phasis.stages.phase2_pipeline import run_phase2_pipeline
-from phasis.stages.phase1_pipeline import run_phase1_pipeline, Phase1Hooks
-from phasis.stages import sam_parsing as st_sam_parsing
-from phasis.stages import cluster_build as st_cluster_build
-from phasis.stages import cluster_scoring as st_cluster_scoring
-from phasis.stages import mapping as st_mapping
-from phasis.stages import library_processing as st_library_processing
-from phasis.stages import indexing as st_indexing
+from phasis.stages.phase1_pipeline import run_phase1_pipeline
 from phasis.stages import input_validation as st_input_validation
 from phasis.stages import dependency_check as st_dependency_check
-from phasis.stages import folder_setup as st_folder_setup
 import phasis.cache as cache
 import phasis.index_integrity as index_integrity
 import phasis.libprep as libprep
@@ -66,11 +47,11 @@ outdir = None
 phase = None
 runtype = None
 
-# ---- legacy config is populated from phasis.runtime (spawn-safe) ----
+# ---- bridge config is populated from phasis.runtime (spawn-safe) ----
 
 def sync_from_runtime() -> None:
     """
-    Populate legacy module globals from phasis.runtime.
+    Populate bridge module globals from phasis.runtime.
     Call this exactly once at the start of legacy_entrypoint().
     """
     global libs, reference, norm, norm_factor, maxhits, runtype, mindepth
@@ -181,26 +162,10 @@ def cleanup():
     """
     return cache.cleanup(getattr(rt, "run_dir", None))
 
-def refClean(filename):
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.stages.indexing.
-    """
-    return st_indexing.refClean(filename)
 
-
-def indexBuilder(reference,ncores):
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.stages.indexing.
-    """
-    return st_indexing.indexBuilder(reference, ncores)
-
-
-def getindex(fh_run):
-    """
-    Thin wrapper to stage implementation (keeps legacy call sites stable).
-    """
-    return st_indexing.getindex(fh_run)
-
+# ---- Phase I bridge wrappers retired ----
+# The Phase I stage functions are now called directly from phasis.stages.phase1_pipeline.
+# bridge.py keeps only the high-level run_phase1() compatibility entrypoint.
 
 def indexIntegrityCheck(index):
 
@@ -234,32 +199,6 @@ def readMem(memFile):
 
     return bool(memflag), index
 
-
-def libraryprocess(libs):
-    """
-    Thin wrapper to stage implementation (keeps legacy call sites stable).
-    """
-    return st_library_processing.libraryprocess(libs)
-
-def mapprocess(libs, genoIndex):
-    """
-    Thin wrapper to stage implementation (keeps legacy call sites stable).
-    """
-    global nproc, nspread
-
-    libs_mapped = st_mapping.mapprocess(
-        libs,
-        genoIndex,
-        ncores_local=ncores,
-    )
-
-    return libs_mapped
-
-def createfolders(currdir):
-    """
-    Thin wrapper to stage implementation (keeps legacy call sites stable).
-    """
-    return st_folder_setup.createfolders(currdir)
 
 def coreReserve(cores):
     """
@@ -304,33 +243,6 @@ def assign_final_cluster_ids(mergedClusterDict, allClusters):
 
 MERGED_REVERSE_BUILT = False
 
-def _ensure_reverse_index() -> dict:
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.ids.
-    """
-    return st_ids._ensure_reverse_index()
-
-def _strip_fileprefix_from_id(
-    cid: str,
-    lib: str | None = None,
-    phase: str | int | None = None,
-    alib: str | None = None,
-) -> str:
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.ids.
-
-    Accepts both the newer ``lib=`` form and the legacy ``alib=`` form.
-    """
-    if lib is None and alib is not None:
-        lib = alib
-    return st_ids._strip_fileprefix_from_id(cid, lib=lib, phase=phase)
-
-def _normalize_cluster_id_for_lookup(x: str) -> str:
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.ids.
-    """
-    return st_ids.normalize_cluster_id_for_lookup(x, phase=getattr(rt, "phase", None))
-
 def process_chromosome_data(loci_group):
     """
     Compatibility wrapper; canonical implementation lives in phasis.stages.phas_clusters.
@@ -352,28 +264,6 @@ def merge_candidate_clusters_parametric(loci_df, allClusters_df, phase, memFile,
         loci_df, allClusters_df, phase, memFile, **kwargs
     )
 
-
-_MERGED_DICT_LOCK = threading.Lock()
-_MERGED_REVERSE_BUILT = False
-
-def _identity_dict_from_tsv_firstcol(path: str, id_col=("Cluster","cluster","clusterID","name","cID")):
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.ids.
-    """
-    return st_ids._identity_dict_from_tsv_firstcol(path, id_col=id_col)
-
-def _set_reverse_merged_map(mcd: dict) -> None:
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.ids.
-    """
-    return st_ids._set_reverse_merged_map(mcd)
-
-def _load_simple_tab_dict(path: str) -> dict:
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.ids.
-    """
-    return st_ids._load_simple_tab_dict(path)
-
 def ensure_mergedClusterDict_always(*, concat_libs, phase, merged_out_path, loci_table_df, allClusters_df, memFile):
     return st_ids.ensure_mergedClusterDict_always(
         concat_libs=concat_libs,
@@ -390,12 +280,6 @@ def load_processed_clusters_fallback(phase: str) -> pd.DataFrame:
     Keeps the legacy signature but ignores the explicit phase argument.
     """
     return st_phas_clusters.load_processed_clusters_fallback()
-
-def _normalize_cluster_df(df: pd.DataFrame, is_concat: bool) -> pd.DataFrame:
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.stages.phase2_pipeline.
-    """
-    return st_phase2_pipeline._normalize_cluster_df(df, is_concat)
 
 def set_win_score_lookup(win_df: pd.DataFrame) -> dict:
     """
@@ -422,18 +306,6 @@ DCL_OVERHANG = 3          # 2-nt 3' overhang in duplex -> 3-nt genomic offset
 WINDOW_MULTIPLIER = 10    # 10 cycles per window
 # ---------- Howell utilities (exact-phase only) ----------
 
-def _strand_masks(df: pd.DataFrame):
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.stages.feature_assembly.
-    """
-    return st_feature_assembly._strand_masks(df)
-
-def _build_pos_abun_exact_phase(df: pd.DataFrame, seq_start: int, seq_end: int, phase: int):
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.stages.feature_assembly.
-    """
-    return st_feature_assembly._build_pos_abun_exact_phase(df, seq_start, seq_end, phase)
-
 def best_sliding_window_score_forward(pos_abun, phase, win_size, seq_start=None, seq_end=None):
     return _best_sliding_window_score_generic(
         pos_abun, phase, win_size, seq_start=seq_start, seq_end=seq_end, forward=True
@@ -443,23 +315,6 @@ def best_sliding_window_score_forward(pos_abun, phase, win_size, seq_start=None,
 def best_sliding_window_score_reverse(pos_abun, phase, win_size, seq_start=None, seq_end=None):
     return _best_sliding_window_score_generic(
         pos_abun, phase, win_size, seq_start=seq_start, seq_end=seq_end, forward=False
-    )
-
-# ---------- STRICT Howell (NO positional wobble; still ONLY len == phase) ----------
-def _evaluate_register_strict_exact(window_positions, pos_abun, win_start, win_end, phase, reg, forward=True):
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.stages.feature_assembly.
-    """
-    return st_feature_assembly._evaluate_register_strict_exact(
-        window_positions, pos_abun, win_start, win_end, phase, reg, forward=forward
-    )
-
-def _evaluate_register(window_positions, pos_abun, win_start, win_end, phase, reg, forward=True):
-    """
-    Compatibility wrapper; canonical implementation lives in phasis.stages.feature_assembly.
-    """
-    return st_feature_assembly._evaluate_register(
-        window_positions, pos_abun, win_start, win_end, phase, reg, forward=forward
     )
 
 def best_sliding_window_score_forward_strict(pos_abun, phase, win_size, seq_start=None, seq_end=None):
@@ -520,36 +375,6 @@ def plot_totalAbundance_heat_map(phasis_result_df, plot_type):
     st_output.phase = phase
     return st_output.plot_totalAbundance_heat_map(phasis_result_df, plot_type)
 
-
-def _plot_wrapper(job):
-    return st_output._plot_wrapper(job)
-
-
-def _finalize_and_write_results(
-    method_name: str,
-    features: pd.DataFrame,
-    *,
-    job_outdir: str | None = None,
-    job_phase: str | int | None = None,
-):
-    """
-    Finalize outputs via output stage without depending on legacy globals.
-
-    - If job_outdir/job_phase are not provided, fall back to rt.* (not legacy module globals).
-    """
-    if job_outdir is None:
-        job_outdir = getattr(rt, "outdir", None)
-
-    if job_phase is None:
-        job_phase = getattr(rt, "phase", None)
-
-    return st_output.finalize_and_write_results(
-        method_name,
-        features,
-        job_outdir=job_outdir,
-        job_phase=job_phase,
-    )
-
 def KNN_phas_clustering(
     features: pd.DataFrame,
     *,
@@ -561,33 +386,29 @@ def KNN_phas_clustering(
     job_phase: str | int | None = None,
 ):
     """
-    KNN classifier (legacy wrapper).
-    Behavior preserved; now supports explicit args/config.
+    KNN classifier (legacy compatibility wrapper).
     """
     print("### KNN classifier ###")
 
-    if cfg is not None:
-        phasisScoreCutoff = cfg.phasisScoreCutoff
-        min_Howell_score = cfg.min_Howell_score
-        max_complexity = cfg.max_complexity
-        job_outdir = cfg.outdir
-        job_phase = cfg.phase
-
-    if phasisScoreCutoff is None:
-        phasisScoreCutoff = globals()["phasisScoreCutoff"]
-    if min_Howell_score is None:
-        min_Howell_score = globals()["min_Howell_score"]
-    if max_complexity is None:
-        max_complexity = globals()["max_complexity"]
-
-    labeled = st_classify.knn_classify(
+    labeled, job_outdir, job_phase = st_classify.knn_classify_for_pipeline(
         features,
-        phasisScoreCutoff=float(phasisScoreCutoff),
-        min_Howell_score=float(min_Howell_score),
-        max_complexity=float(max_complexity),
+        cfg=cfg,
+        phasisScoreCutoff=phasisScoreCutoff,
+        min_Howell_score=min_Howell_score,
+        max_complexity=max_complexity,
+        job_outdir=job_outdir,
+        job_phase=job_phase,
+        default_phasisScoreCutoff=globals()["phasisScoreCutoff"],
+        default_min_Howell_score=globals()["min_Howell_score"],
+        default_max_complexity=globals()["max_complexity"],
     )
 
-    _finalize_and_write_results("KNN", labeled, job_outdir=job_outdir, job_phase=job_phase)
+    return st_output.finalize_and_write_results(
+        "KNN",
+        labeled,
+        job_outdir=job_outdir,
+        job_phase=job_phase,
+    )
 
 
 def GMM_phas_clustering(
@@ -602,42 +423,33 @@ def GMM_phas_clustering(
     job_phase: str | int | None = None,
 ):
     """
-    GMM classifier (legacy wrapper).
-    Behavior preserved; now supports explicit args/config.
+    GMM classifier (legacy compatibility wrapper).
     """
     print("### GMM classifier ###")
 
-    if cfg is not None:
-        phasisScoreCutoff = cfg.phasisScoreCutoff
-        min_Howell_score = cfg.min_Howell_score
-        max_complexity = cfg.max_complexity
-        job_outdir = cfg.outdir
-        job_phase = cfg.phase
-
-    if phasisScoreCutoff is None:
-        phasisScoreCutoff = globals()["phasisScoreCutoff"]
-    if min_Howell_score is None:
-        min_Howell_score = globals()["min_Howell_score"]
-    if max_complexity is None:
-        max_complexity = globals()["max_complexity"]
-
-    labeled = st_classify.gmm_classify(
+    labeled, job_outdir, job_phase = st_classify.gmm_classify_for_pipeline(
         features,
-        phasisScoreCutoff=float(phasisScoreCutoff),
-        min_Howell_score=float(min_Howell_score),
-        max_complexity=float(max_complexity),
         n_clusters=int(n_clusters),
+        cfg=cfg,
+        phasisScoreCutoff=phasisScoreCutoff,
+        min_Howell_score=min_Howell_score,
+        max_complexity=max_complexity,
+        job_outdir=job_outdir,
+        job_phase=job_phase,
+        default_phasisScoreCutoff=globals()["phasisScoreCutoff"],
+        default_min_Howell_score=globals()["min_Howell_score"],
+        default_max_complexity=globals()["max_complexity"],
     )
 
-    _finalize_and_write_results("GMM", labeled, job_outdir=job_outdir, job_phase=job_phase)
+    return st_output.finalize_and_write_results(
+        "GMM",
+        labeled,
+        job_outdir=job_outdir,
+        job_phase=job_phase,
+    )
 
 def compute_scores_for_group(chromosome_data_group):
     return ws.compute_scores_for_group(chromosome_data_group)
-
-
-def _record_clusters_scored_tsv_path(path: str) -> None:
-    return ws._record_clusters_scored_tsv_path(path)
-
 
 def infer_library_from_cluster_id(cid: str, phase_value: int) -> str:
     return ws.infer_library_from_cluster_id(cid, phase_value)
@@ -699,48 +511,8 @@ def select_scoring_windows(clusters_data, **kwargs):
 def run_phase2(clusterFilePaths, cfg: Phase2Config | None = None):
     return run_phase2_pipeline(clusterFilePaths, cfg=cfg)
 
-def parserprocess(libs, load_dicts=False):
-    return st_sam_parsing.parserprocess(libs, load_dicts=load_dicts)
-
 def run_phase1(libs_checked, cfg=None):
-    hooks = Phase1Hooks(
-        createfolders=createfolders,
-        getindex=getindex,
-        libraryprocess=libraryprocess,
-        mapprocess=mapprocess,
-        parserprocess=parserprocess,
-        clusterprocess=clusterprocess,
-        scoringprocess=scoringprocess,
-    )
-    return run_phase1_pipeline(libs_checked, cfg=cfg, hooks=hooks)
-
-def clusterprocess(libs_poscountdict, clustfolder):
-    return st_cluster_build.clusterprocess(libs_poscountdict, clustfolder)
-
-def scoringprocess(
-    libs,
-    libs_clustdicts,
-    libs_nestdict,
-    clustfolder,
-    force_rescore=False,
-    verify_outputs=True,
-    scored_dir=None,
-    purge_existing=False,
-    concat_mode=None,
-    merged_name="ALL_LIBS",
-):
-    return st_cluster_scoring.scoringprocess(
-        libs=libs,
-        libs_clustdicts=libs_clustdicts,
-        libs_nestdict=libs_nestdict,
-        clustfolder=clustfolder,
-        force_rescore=force_rescore,
-        verify_outputs=verify_outputs,
-        scored_dir=scored_dir,
-        purge_existing=purge_existing,
-        concat_mode=concat_mode,
-        merged_name=merged_name,
-    )
+    return run_phase1_pipeline(libs_checked, cfg=cfg)
 
 def legacy_entrypoint():
     """

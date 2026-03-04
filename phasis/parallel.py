@@ -36,7 +36,7 @@ def run_parallel_with_progress(
 
     # Initial chunk size & workers
     chunk_size = _compute_initial_chunk_size(n_data, ncores, unit, min_chunk, batch_factor)
-    print(f"initial chunk size set to {chunk_size}")
+    #print(f"initial chunk size set to {chunk_size}")
     nworkers = min(ncores, chunk_size) or 1
 
     # Decide whether to accumulate results or stream-only
@@ -123,10 +123,10 @@ def run_parallel_with_progress(
                         # Adopt smaller settings if they worked
                         if local_chunk_size < chunk_size:
                             chunk_size = local_chunk_size
-                            print(f"[INFO] Lowering ongoing chunk size to {chunk_size}.")
+                            #print(f"[INFO] Lowering ongoing chunk size to {chunk_size}.")
                         if nw < nworkers:
                             nworkers = nw
-                            print(f"[INFO] Lowering worker count to {nworkers}.")
+                            #print(f"[INFO] Lowering worker count to {nworkers}.")
 
                         break  # worker_trials loop
                     except MemoryError as e:
@@ -161,23 +161,23 @@ def run_parallel_with_progress(
     return results if keep_results else None
 
 def _compute_initial_chunk_size(n_data: int, ncores_local: int, unit: str, min_chunk: int, batch_factor: float):
-    print(f"batch factor set to {batch_factor}")
+    #print(f"batch factor set to {batch_factor}")
     if unit == "lib":
         worker_cap_for_lib = 20  # conservative start for lib-level work
         return min(ncores_local, worker_cap_for_lib) or 1
-    if n_data <= ncores_local:
-        print("n_data <= ncores_local: return 1")
+    #if n_data <= ncores_local:
+        #print("n_data <= ncores_local: return 1")
     #    return 1
     n_batches = int(ncores_local * batch_factor) or 1
-    print(f"n_data is {n_data}")
-    print(f"n_batches set to {n_batches}")
+    #print(f"n_data is {n_data}")
+    #print(f"n_batches set to {n_batches}")
     chunk_size = max(min_chunk, int(n_data / n_batches), int(ncores_local))
-    print(f" Initial chunk_size set to {chunk_size}")
+    #print(f" Initial chunk_size set to {chunk_size}")
     if n_data > 300:
-        print("n_data > 300")
+        #print("n_data > 300")
         max_chunk_size = max(min_chunk, int(ncores_local))
         chunk_size = max(chunk_size, max_chunk_size)
-        print(f" Initial chunk_size set to {chunk_size}")
+        #print(f" Initial chunk_size set to {chunk_size}")
     return max(1, chunk_size)
 
 
@@ -226,11 +226,11 @@ def _pool_initializer(snapshot_path, kind):
     except Exception:
         pass
 
-    # Sync legacy globals from runtime if the function exists
+    # Sync bridge globals from runtime if the function exists
     try:
-        from . import legacy
-        if hasattr(legacy, "sync_from_runtime"):
-            legacy.sync_from_runtime()
+        from . import bridge
+        if hasattr(bridge, "sync_from_runtime"):
+            bridge.sync_from_runtime()
     except Exception:
         pass
 
