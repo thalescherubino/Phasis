@@ -26,6 +26,7 @@ from phasis import ids as st_ids
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.colors import Normalize, LinearSegmentedColormap
+from matplotlib.ticker import FixedLocator
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes, Bbox
 
 try:
@@ -46,6 +47,89 @@ def _join_outdir(dirpath: str | None, name: str) -> str:
 
 def _fallback_series(nrows: int) -> pd.Series:
     return pd.Series([np.nan] * int(nrows))
+
+
+def _set_colorbar_ticks_and_labels(cbar, ticks, labels) -> None:
+    ticks_list = list(ticks)
+    labels_list = list(labels)
+    cbar.set_ticks(ticks_list)
+    cbar.ax.yaxis.set_major_locator(FixedLocator(ticks_list))
+    cbar.set_ticklabels(labels_list)
+
+
+def _format_runtime_parameter_lines() -> list[str]:
+    libs_value = getattr(rt, "libs", None)
+    if isinstance(libs_value, (list, tuple)):
+        libs_list = [str(x) for x in libs_value]
+    elif libs_value is None:
+        libs_list = []
+    else:
+        libs_list = [str(libs_value)]
+
+    class_files = getattr(rt, "class_cluster_file", None)
+    if isinstance(class_files, (list, tuple)):
+        class_files_text = ", ".join(str(x) for x in class_files) if class_files else "None"
+    elif class_files:
+        class_files_text = str(class_files)
+    else:
+        class_files_text = "None"
+
+    libs_text = ", ".join(libs_list) if libs_list else "None"
+
+    return [
+        (
+            "  - Parameters: "
+            f"steps={getattr(rt, 'steps', 'NA')}, "
+            f"phase={getattr(rt, 'phase', 'NA')}, "
+            f"classifier={getattr(rt, 'classifier', 'NA')}, "
+            f"concat_libs={getattr(rt, 'concat_libs', 'NA')}, "
+            f"outdir={getattr(rt, 'outdir', 'NA')}"
+        ),
+        (
+            "  - Inputs: "
+            f"reference={getattr(rt, 'reference', 'NA')}, "
+            f"libs_count={len(libs_list)}, "
+            f"libs={libs_text}, "
+            f"class_cluster_file={class_files_text}"
+        ),
+        (
+            "  - Thresholds/resources: "
+            f"mindepth={getattr(rt, 'mindepth', 'NA')}, "
+            f"maxhits={getattr(rt, 'maxhits', 'NA')}, "
+            f"mismat={getattr(rt, 'mismat', 'NA')}, "
+            f"uniqueRatioCut={getattr(rt, 'uniqueRatioCut', 'NA')}, "
+            f"clustbuffer={getattr(rt, 'clustbuffer', 'NA')}, "
+            f"minClusterLength={getattr(rt, 'minClusterLength', 'NA')}, "
+            f"window_len={getattr(rt, 'window_len', 'NA')}, "
+            f"sliding={getattr(rt, 'sliding', 'NA')}, "
+            f"phasisScoreCutoff={getattr(rt, 'phasisScoreCutoff', 'NA')}, "
+            f"min_Howell_score={getattr(rt, 'min_Howell_score', 'NA')}, "
+            f"max_complexity={getattr(rt, 'max_complexity', 'NA')}, "
+            f"norm={getattr(rt, 'norm', 'NA')}, "
+            f"norm_factor={getattr(rt, 'norm_factor', 'NA')}, "
+            f"cores={getattr(rt, 'cores', 'NA')}, "
+            f"ncores={getattr(rt, 'ncores', 'NA')}, "
+            f"cleanup={getattr(rt, 'cleanup', 'NA')}"
+        ),
+    ]
+
+
+def _print_final_detection_summary(phas_df: pd.DataFrame) -> None:
+    unique_loci = int(phas_df['identifier'].nunique()) if 'identifier' in phas_df.columns else 0
+    total_detections = int(len(phas_df))
+    phase_label = phase if phase is not None else getattr(rt, "phase", "NA")
+
+    print(f"  - Detected {unique_loci} unique {phase_label}-loci across {total_detections} PHAS detections.")
+
+    if total_detections > 0 and 'alib' in phas_df.columns:
+        per_lib = phas_df['alib'].astype(str).value_counts().sort_index()
+        per_lib_text = ", ".join(f"{lib}={int(count)}" for lib, count in per_lib.items())
+        print(f"  - Library detections: {per_lib_text}")
+    else:
+        print("  - Library detections: none")
+
+    for line in _format_runtime_parameter_lines():
+        print(line)
 
 
 def _parse_identifiers_and_alib(features: pd.DataFrame, job_phase: str | int | None):
@@ -257,8 +341,8 @@ def plot_report_heat_map(phasis_result_df, plot_type):
     cax2.spines["bottom"].set_visible(False)
     cax2.spines["left"].set_visible(False)
 
-    cbar = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap), cax=cax2, orientation="vertical")
-    cbar.set_ticklabels(["Not detected", r"non-$\it{PHAS}$ cluster", r"$\it{PHAS}$"])
+    cbar = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=Normalize(vmin=0, vmax=2)), cax=cax2, orientation="vertical")
+    _set_colorbar_ticks_and_labels(cbar, [0, 1, 2], ["Not detected", r"non-$\it{PHAS}$ cluster", r"$\it{PHAS}$"])
 
     ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
     plt.subplots_adjust(left=0.2, right=0.9, top=0.9, bottom=0.1)
@@ -339,8 +423,7 @@ def plot_phasAbundance_heat_map(phasis_result_df, plot_type):
         borderpad=0
     )
     cbar = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=norm), cax=cax, orientation="vertical")
-    cbar.set_ticks([0, max_value/3, 2*max_value/3, max_value])
-    cbar.set_ticklabels([f"{0:.1f}", f"{max_value/3:.1f}", f"{2*max_value/3:.1f}", f"{max_value:.1f}"])
+    _set_colorbar_ticks_and_labels(cbar, [0, max_value/3, 2*max_value/3, max_value], [f"{0:.1f}", f"{max_value/3:.1f}", f"{2*max_value/3:.1f}", f"{max_value:.1f}"])
 
     heat = sns.heatmap(data, square=False, cmap=cmap, cbar=False, norm=norm, xticklabels=True, yticklabels=False, ax=ax)
 
@@ -464,8 +547,7 @@ def plot_totalAbundance_heat_map(phasis_result_df, plot_type):
         borderpad=0
     )
     cbar_phas = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap_phas, norm=norm_phas), cax=cax_phas, orientation="vertical")
-    cbar_phas.set_ticks([0, max_value_phas/3, 2*max_value_phas/3, max_value_phas])
-    cbar_phas.set_ticklabels([f"{0:.1f}", f"{max_value_phas/3:.1f}", f"{2*max_value_phas/3:.1f}", f"{max_value_phas:.1f}"])
+    _set_colorbar_ticks_and_labels(cbar_phas, [0, max_value_phas/3, 2*max_value_phas/3, max_value_phas], [f"{0:.1f}", f"{max_value_phas/3:.1f}", f"{2*max_value_phas/3:.1f}", f"{max_value_phas:.1f}"])
     cbar_phas.set_label(r"log of $\it{PHAS}$ abundance", rotation=90, labelpad=15)
 
     cax_non_phas = inset_axes(
@@ -478,8 +560,7 @@ def plot_totalAbundance_heat_map(phasis_result_df, plot_type):
         borderpad=0
     )
     cbar_non_phas = plt.colorbar(plt.cm.ScalarMappable(cmap=cmap_non_phas, norm=norm_non_phas), cax=cax_non_phas, orientation="vertical")
-    cbar_non_phas.set_ticks([0, max_value_non_phas/3, 2*max_value_non_phas/3, max_value_non_phas])
-    cbar_non_phas.set_ticklabels([f"{0:.1f}", f"{max_value_non_phas/3:.1f}", f"{2*max_value_non_phas/3:.1f}", f"{max_value_non_phas:.1f}"])
+    _set_colorbar_ticks_and_labels(cbar_non_phas, [0, max_value_non_phas/3, 2*max_value_non_phas/3, max_value_non_phas], [f"{0:.1f}", f"{max_value_non_phas/3:.1f}", f"{2*max_value_non_phas/3:.1f}", f"{max_value_non_phas:.1f}"])
     cbar_non_phas.set_label(r"log of non-$\it{PHAS}$ abundance", rotation=90, labelpad=10)
 
     # Chromosome bar (exact original, and this one was already correct)
@@ -650,3 +731,4 @@ def finalize_and_write_results(method_name: str, features: pd.DataFrame, *, job_
     with make_pool(min(3, cpu_count()), kind="plot") as p:
         p.map(_plot_wrapper, plot_jobs)
     print(f"  - Wrote: {all_out}, {calls_out}, and {gff_out}")
+    _print_final_detection_summary(phas_df)
